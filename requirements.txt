@@ -1,0 +1,10 @@
+# 从 HuggingFace 拉 SWE-bench Pro 数据集（fetch_dataset.py）
+datasets>=3.0.0
+
+# 官方评测脚本 swe_bench_pro_eval.py 的依赖：
+#   docker  —— 本机 Docker 后端（--use_local_docker）
+#   pandas  —— 读 --raw_sample_path 那份 JSONL/CSV
+docker>=7.0.0
+pandas>=2.0.0
+
+# 推理（run_codex_pro.py）和报告（pro_eval_report.py / make_report.py）全是标准库。

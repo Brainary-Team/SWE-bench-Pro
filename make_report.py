@@ -1,412 +1,668 @@
 #!/usr/bin/env python3
-"""把这一轮 SWE-bench Pro 的产出汇成 Markdown 报告（格式对齐 SWE-bench verified 那份）。
+"""把 local_eval.py 产出的 eval_report.json 渲染成可视化 HTML 报告。
 
-数据来自四处，各管一段，别混用：
-  results/<run>/*/*.pred          每条实例的耗时/patch/Codex 自己的 token 账
-  results/<eval>/eval_results.json 官方评测的 Resolved 判定
-  logs/usage/usage.jsonl          record_proxy 抓的**上游真实 usage**，是记账的唯一真相
-                                  （Codex 把 cache_creation 折进了 input_tokens，
-                                   拿不到「缓存写入」这一档，而它按 1.25× 计价）
-  docker system df -v             镜像分层，算磁盘
+用法: python make_report.py eval_report.json -o report.html
 
-用法：.venv/bin/python make_report.py > REPORT-relay-opus5-pro30.md
+布局：KPI 一行（结果 + 开销）→ 逐条 instance 表格（instance → PASS 情况）。
+每行一个「N 步」按钮，展开该条的执行过程 —— 从 logs/<iid>.log 解析，
+同时认 Codex 的 JSONL 事件流和 Claude Code 的 stream-json，两种都归一成
+统一的步骤流（命令/消息/思考/改文件/搜索/turn 边界），与 agent 架构无关。
 """
 from __future__ import annotations
 
+import argparse
+import html
 import json
 import re
-import subprocess
-import sys
-from collections import defaultdict
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
-sys.dont_write_bytecode = True
-sys.path.insert(0, str(ROOT / "SWE-bench_Pro-os" / "helper_code"))
-from image_uri import get_dockerhub_image_uri  # noqa: E402
-
-DATASET = ROOT / "pro30.jsonl"
-FULL = ROOT / "swe_bench_pro_full.jsonl"
-RUN = ROOT / "results" / "relay-opus5-pro30"
-EVAL = ROOT / "results" / "eval-relay-opus5-pro30" / "eval_results.json"
-USAGE = ROOT / "logs" / "usage" / "usage.jsonl"
-
-N_FULL = 731          # SWE-bench Pro 全量条数
-TIMEOUT_S = 2400      # 本轮的单实例超时；超过它的耗时一定被宿主机休眠污染了
-
-# 各模型官方 API 价格，美元 / 百万 token。claude-opus-5 一栏经 claude-api skill 核对：
-# 输入 $5、输出 $25，缓存写入 = 1.25×输入，缓存命中 = 0.1×输入。
-PRICES = {
-    "deepseek-v4-flash": (0.14, None, 0.0028, 0.28),
-    "kimi-k3":           (3.00, None, 0.30, 15.00),
-    "claude-opus-5":     (5.00, 6.25, 0.50, 25.00),
-    "gpt-5.6-sol":       (5.00, 6.25, 0.50, 30.00),
+# 颜色取自 dataviz 参考调色板。状态标记恒为「图标 + 文字」，颜色不单独承载语义。
+CSS = """
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; }
+.viz-root {
+  color-scheme: light;
+  --surface-1: #fcfcfb;
+  --plane: #f9f9f7;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+  --grid: #e1e0d9;
+  --baseline: #c3c2b7;
+  --border: rgba(11,11,11,0.10);
+  --good: #0ca30c;
+  --critical: #d03b3b;
+  --warning: #b25000;
+  --acc-blue: #3563cf;
+  --acc-purple: #7e57d0;
+  --acc-teal: #0c7f74;
+  font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", sans-serif;
+  background: var(--plane);
+  color: var(--text-primary);
+  min-height: 100vh;
+  padding: 32px 24px 64px;
+  -webkit-font-smoothing: antialiased;
 }
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .viz-root {
+    color-scheme: dark;
+    --surface-1: #1a1a19; --plane: #0d0d0d;
+    --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #898781;
+    --grid: #2c2c2a; --baseline: #55544f; --border: rgba(255,255,255,0.10);
+    --good: #21ba21; --critical: #e05d5d; --warning: #e08a3c;
+    --acc-blue: #8aa8f2; --acc-purple: #b39df0; --acc-teal: #3ab5a8;
+  }
+}
+:root[data-theme="dark"] .viz-root {
+  color-scheme: dark;
+  --surface-1: #1a1a19; --plane: #0d0d0d;
+  --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #898781;
+  --grid: #2c2c2a; --baseline: #55544f; --border: rgba(255,255,255,0.10);
+  --good: #21ba21; --critical: #e05d5d; --warning: #e08a3c;
+  --acc-blue: #8aa8f2; --acc-purple: #b39df0; --acc-teal: #3ab5a8;
+}
+.wrap { max-width: 1180px; margin: 0 auto; }
+header.top { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 22px; }
+h1 { font-size: 19px; font-weight: 600; margin: 0 0 6px; letter-spacing: -0.01em; }
+.sub { font-size: 13px; color: var(--text-secondary); margin: 0; }
+.sub code { background: var(--grid); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+button.ghost {
+  font: inherit; font-size: 12px; color: var(--text-secondary);
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 11px; cursor: pointer; min-height: 32px;
+}
+button.ghost:hover { background: var(--grid); }
+button.xs { padding: 2px 9px; min-height: 24px; font-size: 11.5px;
+            font-variant-numeric: tabular-nums; white-space: nowrap; }
+button.xs.on { background: var(--grid); color: var(--text-primary); }
+
+/* ---- KPI 行：结果 + 开销 ---- */
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr)); gap: 12px; margin-bottom: 22px; }
+.tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+.tile .k { font-size: 12px; color: var(--text-secondary); margin-bottom: 6px; }
+.tile .v { font-size: 25px; font-weight: 600; line-height: 1.1; letter-spacing: -0.02em;
+           font-variant-numeric: tabular-nums; }
+.tile .n { font-size: 11.5px; color: var(--text-muted); margin-top: 5px; font-variant-numeric: tabular-nums; }
+
+/* ---- 主表：一行一条 instance ---- */
+.card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+        padding: 6px 14px; overflow-x: auto; }
+table.main { width: 100%; border-collapse: collapse; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+table.main th, table.main td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--grid); vertical-align: middle; }
+table.main tbody tr:last-child > td { border-bottom: none; }
+table.main th { font-weight: 600; color: var(--text-secondary); font-size: 11.5px; white-space: nowrap; }
+th.num, td.num { text-align: right; }
+td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+td .s { display: block; font-size: 10.5px; color: var(--text-muted); }
+.st { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; font-weight: 600; font-size: 11.5px; }
+.ok { color: var(--good); } .bad { color: var(--critical); } .mis { color: var(--warning); }
+.chip { width: 15px; height: 15px; border-radius: 4px; display: inline-grid; place-items: center;
+        font-size: 10px; font-weight: 700; color: #fff; flex: none; line-height: 1; }
+.chip.pass { background: var(--good); }
+.chip.fail { background: var(--critical); }
+.chip.miss { background: var(--baseline); color: var(--text-primary); }
+
+/* ---- 展开行：执行过程 ---- */
+tr.exprow > td { background: var(--plane); padding: 14px 16px 18px; }
+/* 关键：不让展开区的 nowrap 内容参与表格取宽 —— 否则长命令会把整张表撑开 */
+.expwrap { contain: inline-size; }
+.failbox { border-left: 3px solid var(--critical); background: var(--surface-1);
+           padding: 10px 13px; border-radius: 0 6px 6px 0; margin-bottom: 12px; }
+.failbox .t { font-size: 12px; font-weight: 600; margin-bottom: 4px; }
+.failbox .m { font-size: 11.5px; color: var(--text-secondary); line-height: 1.55;
+              font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-word; }
+/* ---- 步骤卡片：标签 + 一行摘要，点开看全文 ---- */
+.steps { display: flex; flex-direction: column; gap: 7px; }
+.stp { border: 1px solid var(--border); border-radius: 8px; background: var(--surface-1);
+       font-size: 12px; line-height: 1.5; }
+.stp.bad { box-shadow: inset 3px 0 0 var(--critical); }
+.stp.errc { border-color: color-mix(in srgb, var(--critical) 35%, var(--border));
+            background: color-mix(in srgb, var(--critical) 6%, var(--surface-1)); }
+.stp > summary, .stp > .hd { display: flex; align-items: center; gap: 9px; padding: 6px 11px; min-height: 33px; }
+details.stp > summary { cursor: pointer; list-style: none; border-radius: 8px; }
+details.stp > summary::-webkit-details-marker { display: none; }
+details.stp > summary:hover { background: color-mix(in srgb, var(--grid) 45%, transparent); }
+.chev { flex: none; width: 10px; font-size: 10px; color: var(--text-muted); }
+summary .chev::before { content: "▸"; }
+details[open] > summary .chev::before { content: "▾"; }
+.tag { flex: none; font-size: 10px; font-weight: 700; letter-spacing: .02em;
+       padding: 2px 8px; border-radius: 999px; line-height: 1.5;
+       color: var(--tc, var(--text-secondary));
+       background: color-mix(in srgb, var(--tc, var(--text-secondary)) 13%, transparent); }
+.tag.cmd   { --tc: var(--acc-blue); }
+.tag.mut   { --tc: var(--acc-teal); }
+.tag.think { --tc: var(--acc-purple); }
+.tag.srch  { --tc: var(--warning); }
+.tag.err   { --tc: var(--critical); }
+.sumtx { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+         white-space: nowrap; color: var(--text-primary); }
+.sumtx.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; }
+.sumtx.mline { white-space: pre-wrap; overflow: visible; text-overflow: clip; word-break: break-word; }
+.hr { flex: none; margin-left: auto; display: inline-flex; gap: 9px; align-items: baseline;
+      font-size: 10.5px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.rc { font-weight: 700; font-family: ui-monospace, Menlo, monospace; }
+.stp .bd { border-top: 1px solid var(--grid); padding: 9px 12px 11px; }
+.stp .cap { font-size: 10.5px; color: var(--text-muted); margin: 9px 0 4px; }
+.stp .cap:first-child { margin-top: 0; }
+.stp pre { margin: 0; padding: 8px 10px; background: var(--plane);
+           border: 1px solid var(--grid); border-radius: 6px; overflow-x: auto;
+           font-size: 11.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+           font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text-secondary); }
+.stp .prose { white-space: pre-wrap; word-break: break-word; color: var(--text-primary); font-size: 12px; }
+.turnrow { font-size: 11px; color: var(--text-muted); border-top: 1px dashed var(--grid);
+           padding-top: 7px; margin-top: 3px; font-variant-numeric: tabular-nums; }
+.nolog { font-size: 12px; color: var(--text-muted); margin: 0; }
+.exp-sec { margin-top: 12px; }
+.exp-sec > summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--text-secondary); }
+table.tlist { width: 100%; border-collapse: collapse; font-size: 11.5px; margin-top: 8px;
+              font-variant-numeric: tabular-nums; }
+table.tlist td { padding: 4px 8px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+table.tlist td.mono { white-space: normal; word-break: break-all; }
+pre.diff { margin: 8px 0 0; padding: 10px 12px; background: var(--surface-1); border: 1px solid var(--border);
+           border-radius: 6px; overflow-x: auto; font-size: 11.5px; line-height: 1.5;
+           font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+pre.diff .add { color: var(--good); } pre.diff .del { color: var(--critical); }
+pre.diff .hunk { color: var(--text-muted); }
+"""
+
+JS = """
+document.addEventListener('click', function (ev) {
+  var b = ev.target.closest('[data-exp]');
+  if (!b) return;
+  var tr = document.getElementById(b.getAttribute('data-exp'));
+  if (!tr) return;
+  tr.hidden = !tr.hidden;
+  b.classList.toggle('on', !tr.hidden);
+});
+document.getElementById('toggle-theme').addEventListener('click', function () {
+  var el = document.documentElement;
+  var dark = el.getAttribute('data-theme') === 'dark'
+    || (!el.hasAttribute('data-theme') && matchMedia('(prefers-color-scheme: dark)').matches);
+  el.setAttribute('data-theme', dark ? 'light' : 'dark');
+});
+"""
+
+esc = html.escape
 
 
-def load_jsonl(p: Path) -> list[dict]:
-    return [json.loads(l) for l in p.open() if l.strip()]
+def chip(status: str) -> str:
+    if status == "PASSED":
+        return '<span class="chip pass" aria-hidden="true">✓</span>'
+    if status == "MISSING":
+        return '<span class="chip miss" aria-hidden="true">?</span>'
+    return '<span class="chip fail" aria-hidden="true">✕</span>'
 
 
-def fmt(n) -> str:
-    return f"{n:,}" if isinstance(n, int) else f"{n:,.1f}"
+def fmt_secs(s: float) -> str:
+    s = round(s)
+    return f"{s}s" if s < 60 else f"{s // 60}m{s % 60:02d}s"
 
 
-def relay_usage() -> dict:
-    """上游真实 usage 合计 —— 唯一可信的记账口径。"""
-    t = {"miss": 0, "write": 0, "read": 0, "out": 0, "n": 0, "err": 0}
-    for line in USAGE.open():
-        r = json.loads(line)
-        t["n"] += 1
-        if r["status"] != 200:
-            t["err"] += 1
+def elide(text: str, limit: int) -> str:
+    """中段截断：头尾都保留 —— 命令失败时关键信息（traceback）通常在尾部。"""
+    text = text.rstrip()
+    if limit <= 0 or len(text) <= limit:
+        return text
+    head = int(limit * 0.6)
+    return (text[:head] + f"\n··· 省略 {len(text) - limit:,} 字符 ···\n"
+            + text[-(limit - head):])
+
+
+# ─────────────────────────── 日志 → 统一步骤流 ───────────────────────────
+#
+# 步骤 kind：cmd（命令）/ tool（非 shell 工具）/ msg（agent 发言）/ think（思考）
+#            / file（改文件）/ search / todo / turn（轮次边界+用量）/ err
+# 两种日志格式都归一到这套 kind，渲染层不再关心 agent 是谁。
+
+# Claude Code 工具 → 取哪个入参当摘要（够认出这一步在干什么就行）
+_TOOL_ARG = ("file_path", "path", "pattern", "query", "url", "command",
+             "notebook_path", "prompt", "description")
+
+
+def _claude_tool_arg(inp: dict) -> str:
+    for k in _TOOL_ARG:
+        v = inp.get(k)
+        if isinstance(v, str) and v:
+            return v
+    for v in inp.values():
+        if isinstance(v, str) and v:
+            return v
+    return ""
+
+
+def parse_steps(text: str) -> list[dict]:
+    """Codex JSONL / Claude Code stream-json → 统一步骤列表。
+
+    非 JSON 行（shell 标记、git diff）直接跳过；两种事件词表混在同一个
+    循环里分发，日志是哪家产的无所谓 —— 认事件不认 agent。
+    """
+    steps: list[dict] = []
+    pending: dict[str, dict] = {}   # Claude: tool_use id → 待回填输出的步骤
+
+    def err(msg: str) -> None:
+        # error 事件和 turn.failed 常带同一条消息，连续重复只记一次
+        if msg and not (steps and steps[-1]["kind"] == "err" and steps[-1]["text"] == msg):
+            steps.append({"kind": "err", "text": msg})
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
             continue
-        t["miss"] += r["input_tokens"]
-        t["write"] += r["cache_creation_input_tokens"]
-        t["read"] += r["cache_read_input_tokens"]
-        t["out"] += r["output_tokens"]
-    return t
-
-
-def disk_by_repo(rows: list[dict]) -> dict[str, tuple[int, float, float, float]]:
-    """从 docker system df -v 抠出这 30 个镜像的 SIZE/SHARED/UNIQUE，按仓库聚合。"""
-    want = {get_dockerhub_image_uri(r["instance_id"], "jefzda", r["repo"]): r["repo"]
-            for r in rows}
-    try:
-        out = subprocess.check_output(["docker", "system", "df", "-v"], text=True)
-    except Exception:
-        return {}
-
-    def gb(s: str) -> float:
-        m = re.match(r"([\d.]+)([KMG]B)$", s)
-        return float(m.group(1)) * {"KB": 1e-6, "MB": 1e-3, "GB": 1}[m.group(2)] if m else 0.0
-
-    agg: dict[str, list] = defaultdict(list)
-    for line in out.splitlines():
-        if "jefzda/sweap-images" not in line:
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
             continue
-        p = line.split()
-        uri = f"{p[0]}:{p[1]}"
-        if uri not in want:
-            continue
-        agg[want[uri]].append((gb(p[-4]), gb(p[-3]), gb(p[-2])))
-    return {k: (len(v), sum(i[0] for i in v) / len(v),
-                sum(i[1] for i in v) / len(v), sum(i[2] for i in v) / len(v))
-            for k, v in agg.items()}
+        t = e.get("type")
+
+        # ---- Codex JSONL 事件流 ----
+        if t == "item.completed":
+            it = e.get("item") or {}
+            k = it.get("type")
+            if k == "command_execution":
+                steps.append({"kind": "cmd", "cmd": it.get("command", ""),
+                              "out": it.get("aggregated_output", ""),
+                              "rc": it.get("exit_code")})
+            elif k == "agent_message":
+                steps.append({"kind": "msg", "text": it.get("text", "")})
+            elif k == "reasoning":
+                steps.append({"kind": "think", "text": it.get("text", "")})
+            elif k == "file_change":
+                steps.append({"kind": "file", "changes": [
+                    (c.get("kind", ""), c.get("path", "")) for c in it.get("changes", [])]})
+            elif k == "web_search":
+                steps.append({"kind": "search", "q": it.get("query", "")})
+            elif k == "todo_list":
+                steps.append({"kind": "todo", "items": [
+                    (bool(i.get("completed")), i.get("text", "")) for i in it.get("items", [])]})
+            elif k == "error":
+                err(it.get("message", ""))
+        elif t == "turn.completed":
+            steps.append({"kind": "turn", "usage": e.get("usage") or {}})
+        elif t == "turn.failed":
+            err((e.get("error") or {}).get("message", ""))
+        elif t == "error":
+            err(e.get("message", ""))
+
+        # ---- Claude Code stream-json ----
+        elif t == "assistant":
+            for b in (e.get("message") or {}).get("content") or []:
+                if not isinstance(b, dict):
+                    continue
+                bt = b.get("type")
+                if bt == "text":
+                    steps.append({"kind": "msg", "text": b.get("text", "")})
+                elif bt == "thinking":
+                    steps.append({"kind": "think", "text": b.get("thinking", "")})
+                elif bt == "tool_use":
+                    inp = b.get("input") or {}
+                    if b.get("name") == "Bash":
+                        s = {"kind": "cmd", "cmd": inp.get("command", ""), "out": "", "rc": None}
+                    else:
+                        s = {"kind": "tool", "name": b.get("name", "?"),
+                             "arg": _claude_tool_arg(inp), "out": ""}
+                    steps.append(s)
+                    pending[b.get("id", "")] = s
+        elif t == "user":
+            for b in (e.get("message") or {}).get("content") or []:
+                if not (isinstance(b, dict) and b.get("type") == "tool_result"):
+                    continue                     # 纯文本 user 事件是 prompt 回放，不渲染
+                s = pending.pop(b.get("tool_use_id", ""), None)
+                if s is None:
+                    continue
+                out = b.get("content")
+                if isinstance(out, list):
+                    out = "\n".join(x.get("text", "") for x in out
+                                    if isinstance(x, dict) and x.get("type") == "text")
+                elif not isinstance(out, str):
+                    out = json.dumps(out, ensure_ascii=False)
+                s["out"] = out or ""
+                # stream-json 不回传 exit code，只有 is_error 标志
+                if s["kind"] == "cmd" and s["rc"] is None:
+                    s["rc"] = 1 if b.get("is_error") else 0
+                elif s["kind"] == "tool":
+                    s["err"] = bool(b.get("is_error"))
+        elif t == "result":
+            u = e.get("usage") or {}
+            # 口径对齐 Codex：input = 三个互斥字段之和（同 run_claude_agent.parse_usage）
+            steps.append({"kind": "turn", "final": e.get("subtype", "done"),
+                          "turns": e.get("num_turns", 0),
+                          "cost": e.get("total_cost_usd") or 0.0,
+                          "usage": {
+                              "input_tokens": u.get("input_tokens", 0)
+                                  + u.get("cache_creation_input_tokens", 0)
+                                  + u.get("cache_read_input_tokens", 0),
+                              "cached_input_tokens": u.get("cache_read_input_tokens", 0),
+                              "output_tokens": u.get("output_tokens", 0),
+                              "reasoning_output_tokens": 0}})
+    return steps
+
+
+def _fmt_usage(u: dict) -> str:
+    return (f'输入 {u.get("input_tokens", 0):,}（缓存 {u.get("cached_input_tokens", 0):,}）· '
+            f'输出 {u.get("output_tokens", 0):,}（推理 {u.get("reasoning_output_tokens", 0):,}）')
+
+
+# `/bin/bash -lc '...'` 这层包装是 runner 加的，摘要行里剥掉，只看真正的命令。
+# 展开后的「命令」区仍是原文，剥壳只影响摘要。
+_SHELL_RE = re.compile(r"^\s*(?:/usr)?(?:/bin/)?(?:ba|z|da)?sh\s+-l?c\s+(.*)$", re.S)
+_MUT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}   # Claude Code 的写类工具
+
+
+def strip_shell(cmd: str) -> str:
+    m = _SHELL_RE.match(cmd or "")
+    if not m:
+        return cmd or ""
+    inner = m.group(1).strip()
+    if len(inner) >= 2 and inner[0] == inner[-1] and inner[0] in "'\"":
+        q, inner = inner[0], inner[1:-1]
+        inner = (inner.replace("'\\''", "'") if q == "'"
+                 else inner.replace('\\"', '"').replace("\\$", "$").replace("\\\\", "\\"))
+    elif inner[:1] in ("'", '"'):
+        inner = inner[1:]        # 混合引号包不住时至少去掉开头那个，摘要别带壳
+    return inner
+
+
+def _card(tag_cls: str, tag: str, summary: str, right: str = "", body: str = "",
+          open_: bool = False, bad: bool = False, mono: bool = True) -> str:
+    """一步一张卡：标签 + 单行摘要（+右侧指标）；有 body 才可折叠。"""
+    sumcls = "sumtx mono" if mono else "sumtx"
+    head = (f'<span class="tag {tag_cls}">{esc(tag)}</span>'
+            f'<span class="{sumcls}">{summary}</span>'
+            + (f'<span class="hr">{right}</span>' if right else ""))
+    cls = "stp bad" if bad else "stp"
+    if body:
+        return (f'<details class="{cls}"{" open" if open_ else ""}>'
+                f'<summary><span class="chev"></span>{head}</summary>'
+                f'<div class="bd">{body}</div></details>')
+    # 不可折叠的卡也放一个空 chev 占位，让标签跟可折叠卡对齐
+    return f'<div class="{cls}"><div class="hd"><span class="chev"></span>{head}</div></div>'
+
+
+def steps_html(steps: list[dict], max_out: int) -> str:
+    parts, n_turn = [], 0
+    for s in steps:
+        k = s["kind"]
+        if k == "cmd":
+            orig = s.get("cmd") or ""
+            disp = strip_shell(orig)
+            lines = disp.splitlines() or [""]
+            first = lines[0].strip()
+            rc, out = s.get("rc"), (s.get("out") or "").rstrip()
+            bad = rc not in (None, 0)
+            right = ('<span class="rc" style="color:var(--text-muted)">rc=?</span>' if rc is None
+                     else f'<span class="rc {"bad" if bad else "ok"}">rc={rc}</span>')
+            if len(lines) > 1:
+                right += f'<span>+{len(lines) - 1} 行</span>'
+            if out:
+                right += f'<span>{len(out):,} 字符</span>'
+            body = ""
+            if len(lines) > 1 or len(first) > 100 or disp != orig:
+                body += f'<div class="cap">命令</div><pre>{esc(elide(orig, 1200))}</pre>'
+            if out:
+                body += f'<div class="cap">输出</div><pre>{esc(elide(out, max_out))}</pre>'
+            parts.append(_card("cmd", "命令", esc(first) or "—", right, body,
+                               open_=bad, bad=bad))
+        elif k == "tool":
+            name = s.get("name") or "?"
+            out, bad = (s.get("out") or "").rstrip(), bool(s.get("err"))
+            right = ('<span class="rc bad">error</span>' if bad else "") \
+                + (f'<span>{len(out):,} 字符</span>' if out else "")
+            body = f'<div class="cap">输出</div><pre>{esc(elide(out, max_out))}</pre>' if out else ""
+            parts.append(_card("mut" if name in _MUT_TOOLS else "cmd", name,
+                               esc(elide(s.get("arg", ""), 200)), right, body,
+                               open_=bad, bad=bad))
+        elif k in ("msg", "think"):
+            txt = (s.get("text") or "").strip()
+            if not txt:
+                continue        # 有的桥接端点会发空 agent_message，不值一张卡
+            lines = txt.splitlines()
+            first = next((ln.strip() for ln in lines if ln.strip()), "")
+            long = len(lines) > 1 or len(first) > 110
+            body = (f'<div class="prose">{esc(elide(txt, 4000 if k == "msg" else max_out * 3))}'
+                    '</div>') if long else ""
+            parts.append(_card("think" if k == "think" else "", "思考" if k == "think" else "消息",
+                               esc(first) or "—", f'{len(txt):,} 字符' if long else "",
+                               body, mono=False))
+        elif k == "file":
+            items = [f'{kind} {p}' for kind, p in s["changes"]]
+            body = ("<pre>" + esc("\n".join(items)) + "</pre>") if len(items) > 1 else ""
+            parts.append(_card("mut", "改文件", esc(" · ".join(items)) or "—",
+                               f'{len(items)} 个文件' if len(items) > 1 else "", body))
+        elif k == "search":
+            parts.append(_card("srch", "搜索", esc(s.get("q") or ""), mono=False))
+        elif k == "todo":
+            items = s["items"]
+            done = sum(1 for d, _ in items if d)
+            body = "<pre>" + esc("\n".join(f'{"☑" if d else "☐"} {t}' for d, t in items)) + "</pre>"
+            parts.append(_card("", "TODO", esc("；".join(t for _, t in items)),
+                               f'{done}/{len(items)} 完成', body, mono=False))
+        elif k == "turn":
+            n_turn += 1
+            if "final" in s:   # Claude Code 结尾 result：整个 run 的累计值
+                label = (f'完成（{esc(str(s["final"]))}）· {s.get("turns", 0)} turns · '
+                         + _fmt_usage(s["usage"])
+                         + (f' · ${s["cost"]:.4f}' if s.get("cost") else ""))
+            else:
+                label = f'turn {n_turn} · ' + _fmt_usage(s["usage"])
+            parts.append(f'<div class="turnrow">{label}</div>')
+        elif k == "err":
+            parts.append('<div class="stp errc"><div class="hd"><span class="chev"></span>'
+                         '<span class="tag err">错误</span>'
+                         f'<span class="sumtx mono mline">{esc(elide(s["text"], max_out))}'
+                         '</span></div></div>')
+    return f'<div class="steps">{"".join(parts)}</div>'
+
+
+def diff_html(patch: str) -> str:
+    out = []
+    for ln in patch.splitlines():
+        cls = ""
+        if ln.startswith("+") and not ln.startswith("+++"):
+            cls = "add"
+        elif ln.startswith("-") and not ln.startswith("---"):
+            cls = "del"
+        elif ln.startswith(("@@", "diff ", "index ", "+++", "---")):
+            cls = "hunk"
+        out.append(f'<span class="{cls}">{esc(ln)}</span>' if cls else esc(ln))
+    return "\n".join(out)
+
+
+# ─────────────────────────────── 数据装配 ───────────────────────────────
+
+def load_meta(rep: dict, report_path: str, explicit: str = "") -> dict:
+    """推理侧的 token/耗时由 agent runner 写在 preds.json 旁边的 run_meta.json。
+
+    评测报告里没有这些数字（local_eval.py 只管判卷），所以按 predictions_path 去找。
+    找不到就返回 {} —— mini-swe-agent 的 run 没有这个文件，报告要能正常降级。
+    """
+    cands = []
+    if explicit:
+        cands.append(Path(explicit))
+    if rep.get("predictions_path"):
+        p = Path(rep["predictions_path"]).parent / "run_meta.json"
+        cands += [p, Path(report_path).parent / p]
+    for c in cands:
+        if c.is_file():
+            try:
+                return json.loads(c.read_text())
+            except json.JSONDecodeError:
+                pass
+    return {}
+
+
+def find_logs_dir(rep: dict, report_path: str, explicit: str = "") -> Path | None:
+    """agent 执行日志与 preds.json 同级，在 logs/ 下，一条 instance 一个 .log。"""
+    cands = []
+    if explicit:
+        cands.append(Path(explicit))
+    if rep.get("predictions_path"):
+        p = Path(rep["predictions_path"]).parent / "logs"
+        cands += [p, Path(report_path).parent / p]
+    return next((c for c in cands if c.is_dir()), None)
+
+
+def group_cell(tests: list[dict], group: str) -> str:
+    ts = [t for t in tests if t["group"] == group]
+    if not ts:
+        return '<td class="num">—</td>'
+    ok = sum(1 for t in ts if t["status"] == "PASSED")
+    miss = sum(1 for t in ts if t["status"] == "MISSING")
+    cls = "ok" if ok == len(ts) else ("mis" if miss else "bad")
+    return f'<td class="num"><span class="{cls}">{ok}/{len(ts)}</span></td>'
+
+
+def render(rep: dict, meta: dict | None = None,
+           logs_dir: Path | None = None, max_out: int = 600) -> str:
+    meta = meta or {}
+    minst, mtot = meta.get("instances", {}), meta.get("totals", {})
+    total, resolved = rep["total"], rep["resolved"]
+    pct = (resolved / total * 100) if total else 0.0
+
+    f2p_all = [t for r in rep["instances"] for t in r["tests"] if t["group"] == "FAIL_TO_PASS"]
+    p2p_all = [t for r in rep["instances"] for t in r["tests"] if t["group"] == "PASS_TO_PASS"]
+    f2p_ok = sum(1 for t in f2p_all if t["status"] == "PASSED")
+    p2p_ok = sum(1 for t in p2p_all if t["status"] == "PASSED")
+    applied = sum(1 for r in rep["instances"] if r.get("patch_applied"))
+
+    # ── KPI：结果两块 + 开销三块（无 run_meta.json 时开销块自动消失）──
+    tiles = [
+        f'<div class="tile"><div class="k">Resolved</div><div class="v">{pct:.0f}%</div>'
+        f'<div class="n">{resolved}/{total} 条 · patch 应用 {applied}/{total}</div></div>',
+        f'<div class="tile"><div class="k">测试通过</div>'
+        f'<div class="v">{rep["tests_passed"]}/{rep["tests_total"]}</div>'
+        f'<div class="n">F2P {f2p_ok}/{len(f2p_all)} · P2P {p2p_ok}/{len(p2p_all)}</div></div>',
+    ]
+    if mtot:
+        n = len(minst) or 1
+        cin, ccached = mtot.get("input_tokens", 0), mtot.get("cached_input_tokens", 0)
+        hit = (ccached / cin * 100) if cin else 0.0
+        cost = sum(m.get("total_cost_usd", 0) or 0 for m in minst.values())
+        tiles += [
+            f'<div class="tile"><div class="k">推理耗时</div>'
+            f'<div class="v">{fmt_secs(mtot.get("seconds", 0))}</div>'
+            f'<div class="n">平均 {fmt_secs(mtot.get("seconds", 0) / n)}/条 · '
+            f'{mtot.get("turns", 0)} turns</div></div>',
+            f'<div class="tile"><div class="k">输入 token</div><div class="v">{cin:,}</div>'
+            f'<div class="n">缓存 {ccached:,} · {hit:.0f}%</div></div>',
+            f'<div class="tile"><div class="k">输出 token</div>'
+            f'<div class="v">{mtot.get("output_tokens", 0):,}</div>'
+            f'<div class="n">推理 {mtot.get("reasoning_output_tokens", 0):,}'
+            + (f' · ${cost:.2f}' if cost else "") + '</div></div>',
+        ]
+
+    # ── 主表：instance → PASS 情况，行尾「N 步」展开执行过程 ──
+    has_meta = bool(minst)
+    heads = ['Instance', '结果', '<th class="num">F2P</th>', '<th class="num">P2P</th>',
+             '<th class="num">patch</th>']
+    if has_meta:
+        heads += ['<th class="num">推理</th>', '<th class="num">输入 tok</th>',
+                  '<th class="num">输出 tok</th>']
+    heads += ['<th class="num">评测</th>', '过程']
+    thead = "".join(h if h.startswith("<th") else f"<th>{h}</th>" for h in heads)
+    ncols = 7 + (3 if has_meta else 0)
+
+    body = []
+    for i, r in enumerate(rep["instances"]):
+        ok = r["resolved"]
+        st = ("PASSED", "RESOLVED") if ok else ("FAILED", "UNRESOLVED")
+        row = [f'<td class="mono">{esc(r["instance_id"])}</td>',
+               f'<td><span class="st {"ok" if ok else "bad"}">{chip(st[0])}{st[1]}</span></td>',
+               group_cell(r["tests"], "FAIL_TO_PASS"),
+               group_cell(r["tests"], "PASS_TO_PASS"),
+               f'<td class="num">{r["patch_chars"]:,}'
+               + ('' if r.get("patch_applied") else '<span class="s bad">应用失败</span>')
+               + '</td>']
+        m = minst.get(r["instance_id"], {})
+        if has_meta:
+            row += ([f'<td class="num">{fmt_secs(m.get("seconds", 0))}'
+                     f'<span class="s">{m.get("turns", 0)} turns</span></td>',
+                     f'<td class="num">{m.get("input_tokens", 0):,}'
+                     f'<span class="s">缓存 {m.get("cached_input_tokens", 0):,}</span></td>',
+                     f'<td class="num">{m.get("output_tokens", 0):,}'
+                     f'<span class="s">推理 {m.get("reasoning_output_tokens", 0):,}</span></td>']
+                    if m else ['<td class="num">—</td>'] * 3)
+        row.append(f'<td class="num">{r.get("seconds", 0)}s</td>')
+
+        # 执行过程：logs/<iid>.log 解析成步骤流；没有日志时按钮退化成「明细」
+        steps = []
+        log = logs_dir / f'{r["instance_id"]}.log' if logs_dir else None
+        if log and log.is_file():
+            steps = parse_steps(log.read_text(errors="replace"))
+        n_act = sum(1 for s in steps if s["kind"] in ("cmd", "tool", "search", "file"))
+        row.append(f'<td><button class="ghost xs" data-exp="exp-{i}">'
+                   + (f'{n_act} 步' if n_act else '明细') + '</button></td>')
+
+        # 展开区：失败测试 → 步骤流 → 逐条测试 → 最终 patch
+        exp = []
+        fails = [t for t in r["tests"] if t["status"] != "PASSED"]
+        for t in fails:
+            exp.append(f'<div class="failbox"><div class="t">{chip(t["status"])} '
+                       f'{esc(t["short"])}（{t["group"]} · {t["status"]}）</div>'
+                       + (f'<div class="m">{esc(t["detail"])}</div>' if t["detail"] else "")
+                       + '</div>')
+        if steps:
+            exp.append(steps_html(steps, max_out))
+        else:
+            exp.append('<p class="nolog">无执行日志</p>')
+        tlist = "".join(
+            f'<tr><td><span class="st {"ok" if t["status"] == "PASSED" else "bad"}">'
+            f'{chip(t["status"])}{t["status"]}</span></td>'
+            f'<td>{"F2P" if t["group"] == "FAIL_TO_PASS" else "P2P"}</td>'
+            f'<td class="mono">{esc(t["short"])}</td></tr>' for t in r["tests"])
+        exp.append(f'<details class="exp-sec"><summary>逐条测试 · {len(r["tests"])} 条</summary>'
+                   f'<table class="tlist">{tlist}</table></details>')
+        if r.get("model_patch"):
+            exp.append(f'<details class="exp-sec"><summary>patch · {r["patch_chars"]:,} 字符'
+                       f'</summary><pre class="diff">{diff_html(r["model_patch"])}</pre></details>')
+
+        body.append(f'<tr>{"".join(row)}</tr>'
+                    f'<tr class="exprow" id="exp-{i}" hidden><td colspan="{ncols}">'
+                    f'<div class="expwrap">{"".join(exp)}</div></td></tr>')
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SWE-bench 评测报告</title><style>{CSS}</style></head>
+<body><div class="viz-root"><div class="wrap">
+
+<header class="top"><div>
+  <h1>SWE-bench 评测报告</h1>
+  <p class="sub"><code>{rep['subset']} / {rep['split']}</code> ·
+     <code>{esc(rep['model'] or 'n/a')}</code></p>
+</div>
+<button class="ghost" id="toggle-theme">切换深/浅色</button></header>
+
+<div class="kpis">{''.join(tiles)}</div>
+
+<div class="card">
+<table class="main">
+<thead><tr>{thead}</tr></thead>
+<tbody>{''.join(body)}</tbody>
+</table>
+</div>
+
+</div></div>
+<script>{JS}</script>
+</body></html>"""
 
 
 def main() -> int:
-    rows = load_jsonl(DATASET)
-    meta = {r["instance_id"]: r for r in rows}
-    ev = json.load(EVAL.open())
-    relay = relay_usage()
-
-    recs = []
-    for f in sorted(RUN.glob("*/*.pred")):
-        d = json.load(f.open())
-        iid = d["instance_id"]
-        m = d["_meta"]
-        # 断因要分清：srvtoolu_ 出现在日志里 = 被中转注入的 web_search 打断；
-        # 没有它但有 [TIMEOUT] = 单纯跑超时。两者混成一个数会把结论说歪。
-        log = (f.parent / f"{iid}.log").read_bytes().decode("utf-8", "replace")
-        recs.append({
-            "iid": iid,
-            "repo": meta[iid]["repo"],
-            "lang": meta[iid]["repo_language"],
-            "sec": m["seconds"],
-            "turns": m["turns"],
-            "patch": m["patch_chars"],
-            "inp": m["input_tokens"],
-            "cached": m["cached_input_tokens"],
-            "out": m["output_tokens"],
-            "pull": m["pull_seconds"],
-            "resolved": bool(ev.get(iid, False)),
-            # turns==0 ⇒ Codex 没吐出任何 turn.completed，这条的 token 账是空的
-            "broken": m["turns"] == 0,
-            "link_broken": "srvtoolu_" in log,
-            "hit_timeout": "[TIMEOUT]" in log,
-            # 超过单实例超时的耗时只可能来自宿主机休眠（monotonic 冻结、wall clock 照走）
-            "dirty_time": m["seconds"] is not None and m["seconds"] > TIMEOUT_S,
-        })
-    recs.sort(key=lambda r: (r["repo"], r["iid"]))
-
-    n = len(recs)
-    resolved = sum(r["resolved"] for r in recs)
-    clean = [r for r in recs if not r["dirty_time"] and r["sec"] is not None]
-    P = []                                        # 报告正文
-    A = P.append
-
-    A("# SWE-bench Pro（中转 + bridge + Codex CLI，claude-opus-5）\n")
-    A("SWE-bench Pro 官网：https://github.com/scaleapi/SWE-bench_Pro-os\n")
-
-    # ---------------------------------------------------------------- 1
-    A("## 1. SWE-bench Pro 评测原理\n")
-    A("和 Verified 一样的三步，但难度上了一个台阶：\n")
-    A("1. 给 agent 提供 PR 前的代码快照 + issue 正文 + **Requirements** + **New interfaces**")
-    A("2. agent 根据 issue 解决问题")
-    A("3. 通过 `fail_to_pass` / `pass_to_pass` 判定 —— 全部通过才算 Resolved\n")
-    A("与 Verified 的关键差别：\n")
-    A("| 维度 | Verified | Pro |")
-    A("| --- | --- | --- |")
-    A("| 规模 | 500 条 / 12 个仓库 | 731 条 / 11 个仓库 |")
-    A("| 语言 | 纯 Python | Go 38% / Python 36% / JS 23% / TS 3% |")
-    A("| 仓库路径 | `/testbed` | `/app` |")
-    A("| Prompt | 只有 issue 正文 | issue + Requirements + New interfaces（官方 scaffold）|")
-    A("| 改动量 | 多为单文件小改 | 常跨多文件、多模块 |")
-    A("| 镜像 | ~1.6 GB/环境层 | **1.4–15.7 GB/条**，webclients 单条就 15.7 GB |\n")
-    A("局限性与 Verified 同源（只测测试覆盖得到的、可能被过拟合、训练数据泄漏风险、"
-      "PASS_TO_PASS 覆盖有边界），此处不再重复。\n")
-
-    # ---------------------------------------------------------------- 2
-    A("## 2. 本次评测链路\n")
-    A("```")
-    A("Codex CLI (linux musl 二进制，挂进官方镜像的 /app 里跑)")
-    A("      │  OpenAI Responses 协议 (wire_api=responses)")
-    A("      ▼")
-    A("bridge/bridge.py codex-on-anthropic  (LiteLLM + bridge_patch)")
-    A("      │  Anthropic Messages 协议")
-    A("      ▼")
-    A("https://relay.lzbrainary.com  →  claude-opus-5")
-    A("```\n")
-    A(f"- 模型 `claude-opus-5`，thinking 预算 8k（Codex 的 `model_reasoning_effort` "
-      f"到不了 Anthropic，只能在桥上钉）")
-    A(f"- 并发 3 worker，单实例超时 {TIMEOUT_S}s")
-    A("- 推理和评测**严格分家**：推理起自己的容器，评测由官方 `swe_bench_pro_eval.py` "
-      "另起干净容器跑\n")
-    A("### 上量前必须先补的两个坑\n")
-    A("这条链路**开箱是跑不通的**，两个坑都只有抓包才看得见：\n")
-    A("**坑一：第二轮必崩的 prefill 400。** Codex 把一轮 assistant 拆成 `message` + "
-      "`function_call` 两个 item，LiteLLM 原样转成两条 chat assistant 消息；邻接补丁为满足 "
-      "「tool 必须紧跟 assistant」把 tool 结果提上去，那条纯文本 assistant 就被挤到了数组**最后** "
-      "→ Anthropic 当成 prefill 直接 400：\n")
-    A("```")
-    A("This model does not support assistant message prefill.")
-    A("The conversation must end with a user message.")
-    A("```\n")
-    A("报错在撒谎（请求确实以 user+tool_result 结尾），且第一轮永远不炸 —— 冒烟全绿、"
-      "一干活就废。修法：`merge_adjacent_assistants()` 先把连续 assistant 合并成一条。\n")
-    A("**坑二：缓存命中率。** LiteLLM 从 Responses 转 Anthropic 时**一个 `cache_control` 都不加**，"
-      "agent 每轮都按未命中价重付整段历史。LiteLLM 自带的 `cache_control_injection_points` "
-      "在这条链路上无效（system 那条会被搬进顶层 `system`、断点半路丢失；落到 `tool` 消息时写的是"
-      "消息级 cache_control，转成 `tool_result` 块时同样丢失 —— 实测 9 次请求只有 1 次真带上）。"
-      "改成在**最终 Anthropic body** 上自己打三个断点：\n")
-    A("| 断点 | 位置 | 作用 |")
-    A("| --- | --- | --- |")
-    A("| `system` | `system` 末块 | 每轮都一样，稳定命中 |")
-    A("| `prev` | `messages[-3]` 末块 | **主力**。Anthropic 只在本次请求显式标了 cache_control 的位置查缓存；"
-      "`last` 是本轮新产生的、从没写进过缓存，必然 miss |")
-    A("| `last` | `messages[-1]` 末块 | 把本轮新增写进缓存，供下一轮的 `prev` 命中 |\n")
-    A("命中率实测：**无断点 23% → 只标 system+last 65% → 三个断点 96%**（单实例冒烟），"
-      f"30 条全量下来 **{100*relay['read']/(relay['miss']+relay['write']+relay['read']):.1f}%**。\n")
-
-    # ---------------------------------------------------------------- 3
-    A("## 3. 评测集分布\n")
-    A("从全量 731 条里按「仓库均匀」抽 30 条：8 个大仓 ×3 + 3 个小仓 ×2。"
-      "仓内按 `instance_id` 排序后**等距抽样**（不是取前 N 条，否则会扎堆在同一批 PR 上），"
-      "并逐条 `docker manifest inspect` 校验 tag 存在（官方数据集里确有 404 的 tag）。\n")
-    byrepo = defaultdict(lambda: [0, 0])
-    bylang = defaultdict(lambda: [0, 0])
-    for r in recs:
-        byrepo[r["repo"]][0] += 1
-        byrepo[r["repo"]][1] += r["resolved"]
-        bylang[r["lang"]][0] += 1
-        bylang[r["lang"]][1] += r["resolved"]
-    full = load_jsonl(FULL)
-    fullrepo = defaultdict(int)
-    for r in full:
-        fullrepo[r["repo"]] += 1
-    A("| 仓库 | 语言 | 全量 | 本次抽样 | Resolved |")
-    A("| --- | --- | ---: | ---: | ---: |")
-    for repo, (c, ok) in sorted(byrepo.items(), key=lambda x: -fullrepo[x[0]]):
-        lang = next(r["lang"] for r in recs if r["repo"] == repo)
-        A(f"| `{repo}` | {lang} | {fullrepo[repo]} | {c} | {ok}/{c} |")
-    A(f"| **合计** | | **{len(full)}** | **{n}** | **{resolved}/{n}** |\n")
-    A("语言分布（抽样 vs 全量）：" + "、".join(
-        f"{k} {v[0]}/{n}={100*v[0]/n:.0f}%（全量 {100*sum(1 for r in full if r['repo_language']==k)/len(full):.0f}%）"
-        for k, v in sorted(bylang.items(), key=lambda x: -x[1][0])) + "\n")
-
-    # ---------------------------------------------------------------- 4
-    A("## 4. 结果\n")
-    A(f"**Resolved {resolved}/{n} = {100*resolved/n:.1f}%**"
-      f"（非空 patch {sum(1 for r in recs if r['patch'] > 0)}/{n}）\n")
-    broken = [r for r in recs if r["broken"]]
-    link = [r for r in recs if r["link_broken"]]
-    tmo = [r for r in recs if r["hit_timeout"]]
-    A(f"这 {n} 条里有 {len(broken)} 条**根本没跑完**，断因分两类，别混：\n")
-    A(f"**a) 中转注入 `web_search` 打断（{len(link)} 条）。** 中转会往请求里注入服务端 "
-      f"`web_search` 工具，模型一旦调用，返回的 `srvtoolu_…` 块 Codex round-trip 不回去，"
-      f"下一轮直接 400：\n")
-    A("```")
-    A("messages.20.content.0: unexpected `tool_use_id` found in `tool_result` blocks:")
-    A("srvtoolu_01ScBVTv2kdNjUj355HwdEeH. Each `tool_result` block must have a")
-    A("corresponding `tool_use` block in the previous message.")
-    A("```\n")
-    A(f"这是**确定性**打断（{len(link)} 条日志里都有 `srvtoolu_`，`rc=1`），不是偶发。"
-      f"这 {len(link)} 条全部判 ❌，但责任在链路不在模型。\n")
-    A(f"**b) 跑到超时（{len(tmo)} 条）。** 与 `web_search` 无关，日志里没有 `srvtoolu_`。\n")
-    valid = n - len(link)
-    A(f"扣掉 a) 的 {len(link)} 条链路故障，有效样本 {valid} 条里 "
-      f"Resolved {resolved}/{valid} = **{100*resolved/valid:.1f}%**。"
-      f"两个数字都列出来：**{100*resolved/n:.1f}%** 是这条链路当下的真实交付率，"
-      f"**{100*resolved/valid:.1f}%** 是修好注入问题后能期待的水平。\n")
-
-    A("### 逐条明细\n")
-    A("| instance | 语言 | 秒 | turns | 输入 | 缓存命中 | 命中率 | 输出 | patch | 结果 |")
-    A("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |")
-    for r in recs:
-        hit = f"{100*r['cached']/r['inp']:.1f}%" if r["inp"] else "—"
-        sec = "TIMEOUT" if r["sec"] is None else (
-            f"{r['sec']:.0f}*" if r["dirty_time"] else f"{r['sec']:.0f}")
-        short = r["iid"].replace("instance_", "")
-        short = short[:38] + "…" if len(short) > 39 else short
-        A(f"| `{short}` | {r['lang']} | {sec} | {r['turns']} | {fmt(r['inp'])} | "
-          f"{fmt(r['cached'])} | {hit} | {fmt(r['out'])} | {r['patch']}B | "
-          f"{'✅' if r['resolved'] else '❌'} |")
-    A("")
-    A("`*` = 耗时被宿主机休眠污染（见「已知问题」），token / patch / 判定不受影响；"
-      "`turns=0` = 没跑完，Codex 的 token 账为空（真实消耗见 §5.2 中转那一行）。\n")
-
-    # ---------------------------------------------------------------- 5
-    A("## 5. 评测资源使用情况估计\n")
-    A("### 5.1 磁盘使用估计\n")
-    A("Pro 的镜像**没有 Verified 那种「80 种环境层大家共用」的结构** —— 实测同仓库不同实例之间"
-      "共享层很少，绝大部分是每条独有的。所以不能照搬 Verified 的算法，只能按「每条独有」累加。\n")
-    dk = disk_by_repo(rows)
-    if dk:
-        A("| 仓库 | n | 平均 SIZE | 平均 SHARED | 平均 UNIQUE（=实际增量） |")
-        A("| --- | ---: | ---: | ---: | ---: |")
-        for repo, (c, s, sh, u) in sorted(dk.items(), key=lambda x: -x[1][3]):
-            A(f"| `{repo}` | {c} | {s:.2f} GB | {sh:.2f} GB | **{u:.2f} GB** |")
-        tot_u = sum(v[3] * v[0] for v in dk.values())
-        A(f"| **本次 30 条合计** | **{sum(v[0] for v in dk.values())}** | | | "
-          f"**{tot_u:.1f} GB** |\n")
-        # 按仓库均值 × 全量该仓条数外推
-        est = sum(dk[r][3] * fullrepo[r] for r in dk if r in fullrepo)
-        A(f"按每仓 UNIQUE 均值 × 全量该仓条数外推，**全量 731 条约 {est:.0f} GB**"
-          f"（Verified 500 条只要 ~230 GB —— Pro 贵在镜像上，不在 token 上）。\n")
-        A(f"> 单条最贵的是 `protonmail/webclients`：**{dk['protonmail/webclients'][3]:.1f} GB/条**，"
-          f"全量 65 条就要 {dk['protonmail/webclients'][3]*65:.0f} GB。"
-          f"磁盘紧张时优先跳过这个仓。\n")
-        A("> 实测本次 30 条把 Docker 占用从 109.6 GB 推到 ~228 GB。跑全量前先确认有 "
-          "**1 TB 以上**空闲，或者边跑边 `docker image rm`。\n")
-
-    A("### 5.2 token 和费用估计\n")
-    tot_in = relay["miss"] + relay["write"] + relay["read"]
-    A(f"记账口径：**以中转上游抓到的 usage 为准**（`logs/usage/usage.jsonl`，"
-      f"共 {relay['n']} 次上游请求，其中 {relay['err']} 次非 200）。"
-      f"不用 Codex 自己那份 —— 它把 `cache_creation` 折进了 `input_tokens`，"
-      f"拿不到「缓存写入」这一档，而这档按 **1.25×** 计价。\n")
-    A(f"| 口径 | 未命中输入 | 缓存写入 | 缓存命中 | 输入合计 | 输出 |")
-    A(f"| --- | ---: | ---: | ---: | ---: | ---: |")
-    A(f"| 中转上游（真实）| {fmt(relay['miss'])} | {fmt(relay['write'])} | "
-      f"{fmt(relay['read'])} | {fmt(tot_in)} | {fmt(relay['out'])} |")
-    pin = sum(r["inp"] for r in recs)
-    pout = sum(r["out"] for r in recs)
-    A(f"| Codex `.pred` 合计 | \\* 折进输入 | \\* 折进输入 | {fmt(sum(r['cached'] for r in recs))} | "
-      f"{fmt(pin)} | {fmt(pout)} |")
-    A(f"| 差额 | | | | {fmt(tot_in-pin)} | {fmt(relay['out']-pout)} |\n")
-    A(f"差额来自两处：没跑完的 {len(broken)} 条（Codex 没产出 `turn.completed`，账是空的，"
-      f"但请求已经真金白银发出去了），以及一个**跑飞的孤儿容器**（见「已知问题」）。"
-      f"**做预算时按中转那一行算**，Codex 那份会少算 14%。\n")
-    A(f"**缓存命中率 {100*relay['read']/tot_in:.1f}%**，"
-      f"实付输入只有 {fmt(relay['miss']+relay['write'])} token —— "
-      f"这就是 §2 那三个断点的价值。\n")
-
-    A("#### 本次 30 条的实际费用\n")
-    A("| 模型 | 实付输入 | 缓存写入 | 缓存命中 | 输出 | 合计 |")
-    A("| --- | ---: | ---: | ---: | ---: | ---: |")
-    for name, (pi, pw, pr, po) in PRICES.items():
-        w = relay["write"] / 1e6 * (pw if pw else pi)
-        c = (relay["miss"] / 1e6 * pi, w, relay["read"] / 1e6 * pr, relay["out"] / 1e6 * po)
-        mark = " ⬅ 本次" if name == "claude-opus-5" else ""
-        A(f"| {name}{mark} | ${c[0]:.2f} | ${c[1]:.2f} | ${c[2]:.2f} | ${c[3]:.2f} | "
-          f"**${sum(c):.2f}** |")
-    A("")
-    A("#### 外推全量 731 条\n")
-    k = N_FULL / n
-    A(f"按 30 条均值 × {N_FULL} 线性外推（token 数单位：M）：\n")
-    A("| 模型 | 实付输入 | 缓存写入 | 缓存命中 | 输出 | 合计 |")
-    A("| --- | ---: | ---: | ---: | ---: | ---: |")
-    A(f"| **token 数** | {relay['miss']*k/1e6:.2f} M | {relay['write']*k/1e6:.2f} M | "
-      f"{relay['read']*k/1e6:.1f} M | {relay['out']*k/1e6:.2f} M | "
-      f"{(tot_in+relay['out'])*k/1e6:.1f} M |")
-    for name, (pi, pw, pr, po) in PRICES.items():
-        w = relay["write"] * k / 1e6 * (pw if pw else pi)
-        c = (relay["miss"] * k / 1e6 * pi, w, relay["read"] * k / 1e6 * pr,
-             relay["out"] * k / 1e6 * po)
-        mark = " ⬅ 本次" if name == "claude-opus-5" else ""
-        A(f"| {name}{mark} | ${c[0]:.2f} | ${c[1]:.2f} | ${c[2]:.2f} | ${c[3]:.2f} | "
-          f"**${sum(c):.2f}** |")
-    A("")
-    A("> 这是按**官方 API 价**算的。走订阅/中转的实际单价通常更低，且实际 token 消耗"
-      "受 thinking 预算、`effort`、超时设置影响，无法完全锁死。\n")
-
-    A("### 5.3 时间\n")
-    if clean:
-        secs = sorted(r["sec"] for r in clean)
-        med = secs[len(secs) // 2]
-        A(f"只统计**未被休眠污染**的 {len(clean)} 条（`seconds` ≤ 单实例超时 {TIMEOUT_S}s）：\n")
-        A(f"- 中位 **{med:.0f}s**，均值 {sum(secs)/len(secs):.0f}s，"
-          f"最快 {secs[0]:.0f}s，最慢 {secs[-1]:.0f}s")
-    pulls = [r["pull"] for r in recs if r["pull"] > 0]
-    if pulls:
-        cp = [p for p in pulls if p <= TIMEOUT_S]      # 同样要剔掉跨休眠的
-        A(f"- 拉镜像 {len(pulls)} 次；剔掉 {len(pulls)-len(cp)} 次跨休眠的，"
-          f"其余 {len(cp)} 次中位仅 {sorted(cp)[len(cp)//2]/60:.1f} 分钟，"
-          f"但长尾很重（最慢 {max(cp)/60:.1f} 分钟，webclients 那种十几 GB 的）。"
-          f"这部分**不计入解题耗时**，但要计入跑完全量的墙钟预算")
-    A(f"- **解题耗时不含拉镜像**：`ensure_image()` 在计时开始前跑完并单独计入 `pull_seconds`；"
-      f"报告里的「秒」取容器内 `AGENT_T0/T1` 时间戳之差，只包住 `codex exec`，"
-      f"不含建容器、`git reset`、收尾 `git diff`（实测这些开销 1–12s）")
-    A(f"- 3 worker 并发跑完 30 条的墙钟约 {55551.9/3600:.1f} 小时（含拉镜像和被污染的那几条）\n")
-
-    # ---------------------------------------------------------------- 6
-    A("## 6. 已知问题\n")
-    A("| 问题 | 影响 | 状态 |")
-    A("| --- | --- | --- |")
-    A(f"| 中转注入服务端 `web_search`，`srvtoolu_…` 块 Codex round-trip 不回去 | "
-      f"确定性打断 **{len(link)}/{n}** 条，全判 ❌ | ❌ 未修，需中转侧关掉注入 |")
-    A("| 宿主机休眠导致计时失真：macOS 休眠时 `time.monotonic()` 冻结（所以 2400s 超时没触发）"
-      "而 `time.time()` 和容器内 `date` 照走 | "
-      f"{sum(1 for r in recs if r['dirty_time'])} 条耗时虚高，token/patch 不受影响 | "
-      "✅ 已改用 monotonic 计时 + `caffeinate` 防休眠 |")
-    A("| `subprocess.run(timeout=)` 杀的是 docker **客户端**，容器还在后台跑 | "
-      "1 个孤儿容器多跑了 14 小时，一直在烧中转 token 并污染记账 | "
-      "✅ 已改成 `--name` + 超时后 `docker rm -f` |")
-    A("| 超时被杀的实例只有 `AGENT_T0` 没有 `T1` | "
-      "旧代码会退回 `wall_seconds` 冒充解题耗时，把统计拉爆 | "
-      "✅ 已改成留空并标 `timed_out` |")
-    A("| Codex 报 `Model metadata for claude-opus-5 not found` | "
-      "只是元数据缺失的告警，功能正常 | ⚠️ 可忽略 |")
-    A("")
-    A("## 7. 复现\n")
-    A("```bash")
-    A("# 0. 选 30 条均匀分布的实例（含镜像存在性校验）")
-    A(".venv/bin/python select30.py")
-    A("")
-    A("# 1. 起桥（三个 cache 断点 + prefill 补丁）")
-    A('RELAY_KEY="sk-..." bridge/.venv/bin/python bridge/bridge.py codex-on-anthropic \\')
-    A("  --base-url https://relay.lzbrainary.com --model claude-opus-5 --env-key RELAY_KEY \\")
-    A("  --max-tokens 32000 --thinking-budget 8000 --cache-points system,prev,last \\")
-    A("  --host 0.0.0.0 --port 4000")
-    A("")
-    A("# 2. 跑 agent（先跑 --slice 0:1 验一条再放量）")
-    A(".venv/bin/python run_codex_pro.py --dataset pro30.jsonl \\")
-    A("  --model claude-opus-5 --provider bridge \\")
-    A("  --base-url http://host.docker.internal:4000/v1 --api-key sk-bridge \\")
-    A("  --codex-bin /path/to/codex-x86_64-unknown-linux-musl \\")
-    A(f"  --workers 3 --timeout {TIMEOUT_S} -o results/relay-opus5-pro30")
-    A("")
-    A("# 3. 汇总 + 官方评测")
-    A(".venv/bin/python SWE-bench_Pro-os/helper_code/gather_patches.py \\")
-    A("  --directory results/relay-opus5-pro30 --prefix relay-opus5 \\")
-    A("  --output relay_opus5_pro30_patches.json")
-    A(".venv/bin/python eval_pro.py --dataset pro30.jsonl \\")
-    A("  --patches relay_opus5_pro30_patches.json \\")
-    A("  --output-dir results/eval-relay-opus5-pro30 --workers 3")
-    A("```")
-
-    print("\n".join(P))
+    ap = argparse.ArgumentParser()
+    ap.add_argument("report", nargs="?", default="eval_report.json")
+    ap.add_argument("-o", "--output", default="report.html")
+    ap.add_argument("--meta", default="", help="run_meta.json 路径（默认按 predictions_path 自动找）")
+    ap.add_argument("--logs", default="", help="agent 日志目录（默认 preds.json 同级的 logs/）")
+    ap.add_argument("-n", "--max-output", type=int, default=600,
+                    help="执行过程里每段输出的截断字符数")
+    a = ap.parse_args()
+    rep = json.load(open(a.report))
+    meta = load_meta(rep, a.report, a.meta)
+    logs_dir = find_logs_dir(rep, a.report, a.logs)
+    Path(a.output).write_text(render(rep, meta, logs_dir, a.max_output), encoding="utf-8")
+    n_logs = sum(1 for r in rep["instances"]
+                 if logs_dir and (logs_dir / f'{r["instance_id"]}.log').is_file())
+    print(f"已生成 {a.output}（{rep['total']} 条 · 执行日志 {n_logs} 条"
+          + ("" if meta.get("totals") else " · 未找到 run_meta.json，无推理开销") + "）")
     return 0
 
 
