@@ -44,7 +44,7 @@ agent 在推理容器里干了什么都不会污染评测。
 ## 一、拿到代码
 
 ```bash
-git clone <你的仓库地址> ~/swebench-pro
+git clone https://github.com/Brainary-Team/SWE-bench-Pro.git ~/swebench-pro
 cd ~/swebench-pro
 ```
 
@@ -420,7 +420,7 @@ open report_pro.html
 
 ```bash
 # ── 一次性安装 ──
-git clone <你的仓库地址> ~/swebench-pro
+git clone https://github.com/Brainary-Team/SWE-bench-Pro.git ~/swebench-pro
 cd ~/swebench-pro && ./setup.sh
 # Docker Desktop：勾 Rosetta；磁盘 200 GB+；内存 8 GB+
 
