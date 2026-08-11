@@ -292,7 +292,7 @@ watch -n 60 'df -h / | tail -1; docker system df | head -3'
 ### 查看某条里 agent 干了什么（可跳过）
 
 ```bash
-# --commands      只列执行过的命令（不带输出），扫一眼用这个最快
+# --commands      命令只留命令行、不带输出（agent 的发言和报错照常打），扫一眼用这个最快
 # --max-output N  每段输出截断字符数，默认 600
 # --full          不截断
 python show_codex_run.py results/codex-pro/logs/<iid>.log --commands
@@ -353,11 +353,18 @@ open report_pro.html
   后者是起容器前写的，差值约等于评测容器的墙钟。
 - **失败测试展开后没有错误信息**。Pro 的 parser 只吐 `{name, status}`，
   没有 pytest 那种 short summary。要看原因去 `results/<eval>/<iid>/codex_stdout.log`。
-- **「patch 应用失败」在 Pro 里含义更宽**。官方 `eval_results.json` 只有 true/false，
-  拉不到镜像、`git apply` 失败、测试进程崩了、解析器炸了，一律记 false，分不开。
-  这里的判据是「评测有没有产出 `codex_output.json`」：没有就记应用失败，
-  并在 `eval_pro.json` 里写 `note: "no_eval_output"`。真正的原因得去
-  `codex_stdout.log` / `codex_stderr.log` 和评测那轮的终端输出里翻。
+- **「patch 应用」这一列在 Pro 里读作「补丁确实进了这一轮评测」**，不是「`git apply` 成功」。
+  Verified 能从 harness 的输出里直接看到 apply 成没成功；Pro 看不到 ——
+  它的 entryscript 没有 `set -e`，`git apply` 的输出只进容器 stdout，
+  而容器是 `detach + remove` 起的，日志当场就没了。所以这里只判两件事：
+  评测出了 `codex_output.json`，且它存的 patch 快照与推理产物**逐字节相同**。
+  不满足就记应用失败，并在 `eval_pro.json` 里写 `note`：
+  `no_eval_output`（没出结果）或 `stale_eval_output`（复用了旧结果）。
+  真正的原因去 `codex_stdout.log` / `codex_stderr.log` 和评测那轮的终端输出里翻。
+- **`推理` 列对超时的条目显示的是墙钟**，不是解题耗时。容器被超时杀掉时只有起始打点、
+  没有结束打点，拿不到净耗时。记 0 会让这条从 KPI 里凭空消失（烧了 30 分钟却显示没花时间），
+  所以退回墙钟，口径与 Verified 一致；`run_meta.json` 里的
+  `seconds_measured_in_container: false` 标着这条是估的。
 - **判定口径照抄官方**：`(fail_to_pass | pass_to_pass) ⊆ {status == PASSED 的测试名}`。
   注意是按名字取并集再判包含 —— 同名测试出现多次时**只要有一次 PASSED 就算过**
   （instance 的 Dockerfile 普遍开了 `--reruns=3`，重复行是常态）。
@@ -379,7 +386,7 @@ open report_pro.html
    `interface` 存的是 JSON 字符串字面量：首尾带真的双引号、换行是字面的两个字符 `\n`。
    直接塞进 prompt，模型看到的是一坨转义符。`run_codex_pro.py` 里的 `_unwrap()`
    只在「首尾是双引号且能解出字符串」时剥一层，另外 403 条纯文本原样放行。
-5. **372 条的 `pass_to_pass` 是空的**（go 257/280、ts 19/20）。
+5. **372 条的 `pass_to_pass` 是空的**（go 257/280、python 59/266、js 37/165、ts 19/20）。
    算 P2P 通过率时分母会是 0，报告里显示成 `—`。
 6. **`run_scripts/` 有 1000 个目录，但公开集只有 731 条**。多出来的 269 个不在公开集里，
    拿它数实例数会数多。
@@ -393,8 +400,14 @@ open report_pro.html
 - **它不打 `test_patch`**。测试文件是靠 `before_repo_set_cmd` 的**最后一行**
   （通常是 `git checkout <fix_sha> -- <测试文件>`）捞回来的，而且这一步在
   `git apply 模型补丁` **之后**执行 —— 所以 agent 对测试文件的任何改动都会被覆盖掉。
-  推理侧 `run_codex_pro.py` 也在 `git add` 时用 `:(exclude)` 把测试文件挡在 patch 之外，
-  两头都堵上了。
+  推理侧 `run_codex_pro.py` 也在 `git add` 时用 `:(exclude,glob)` 把常见的测试文件命名
+  （`test_*` / `*_test.go` / `*.test.ts` / `tests/` / `__tests__/` …）挡在 patch 之外。
+  这层是尽力而为的白名单，不保证覆盖所有仓库的命名习惯 —— 真正兜底的是评测那边的强制 checkout。
+
+  > `:(exclude)` **必须带 `glob`**。不带的话 git 用的是不加 `FNM_PATHNAME` 的 fnmatch，
+  > `*` 会跨 `/` 匹配，`:(exclude)*test_*` 就变成「路径里任意位置含 `test_` 就排除」——
+  > `src/latest_news.go`（la·test_·news）会被无声地从 patch 里剔掉，
+  > 表现成模型明明改了却判不过。
 
 ---
 
@@ -482,5 +495,5 @@ docker image prune -a -f
 | 报告「过程」列全是「明细」，展不出步骤 | 没找到 `logs/<iid>.log`。确认 `predictions_path` 指的是 `<run>/preds.json` |
 | `agent=TIMEOUT`，patch 是空的 | 容器被 `--timeout` 杀了。注意超时后脚本会显式 `docker rm -f`：不显式杀的话 `subprocess` 只杀 docker 客户端，容器会在后台接着跑、接着烧 token |
 | 磁盘瞬间见底 | Pro 镜像平均 5.1 GB。`--rm-image` 必开；评测阶段还会再拉一遍 |
-| `docker run` 报 `no matching manifest` | 没开 Rosetta，或漏了 `--platform linux/amd64` |
+| `docker run` 报 `no matching manifest` | 漏了 `--platform linux/amd64`（镜像只有 amd64，Docker 默认按本机 arm64 找）。跟 Rosetta 没关系 —— Rosetta 只管跑得快不快，不管拉不拉得到 |
 | 推理正常但 patch 恒为空 | 端点不支持 Responses API。用第三节的 curl 验一下 |

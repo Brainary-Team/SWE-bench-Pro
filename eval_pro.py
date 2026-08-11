@@ -73,8 +73,10 @@ def main() -> int:
         patches.write_text(json.dumps(recs, indent=2, ensure_ascii=False))
         print(f"[eval] 收到 {len(recs)} 条补丁（空 patch {n_empty} 条）→ {patches}", flush=True)
 
+    # -B：子进程也别写 .pyc。父进程的 sys.dont_write_bytecode 不会继承给 subprocess，
+    # 少了它，官方脚本 import helper_code 时就会在纯净的 clone 里落一堆 __pycache__。
     cmd = [
-        sys.executable, str(script),
+        sys.executable, "-B", str(script),
         f"--raw_sample_path={Path(args.dataset).resolve()}",
         f"--patch_path={patches}",
         f"--output_dir={out}",

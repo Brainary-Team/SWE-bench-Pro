@@ -29,6 +29,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -72,11 +73,20 @@ USAGE_FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens
 
 # patch 里要挡掉的东西：测试文件（评测阶段本来就会强制覆盖，留着只会让 patch 变脏）
 # 和 agent 自己的草稿/构建产物。
+#
+# ⚠️ 每条都必须带 `glob` magic。不带的话 git pathspec 用的是 fnmatch **不加 FNM_PATHNAME**，
+# `*` 会跨 `/` 匹配，于是 `:(exclude)*test_*` 这种写法是「路径里任意位置含 test_ 就排除」——
+# `src/latest_news.go` 里的 "la|test_|news" 就中招，真源码被无声地从 patch 里删掉，
+# 表现成模型明明改了却判不过。加了 glob 之后 `*` 不跨 `/`，`**/` 才表示任意层级。
 EXCLUDES = [
-    "':(exclude)*test_*'", "':(exclude)*_test.go'", "':(exclude)*_test.py'",
-    "':(exclude)*test/*'", "':(exclude)*tests/*'", "':(exclude)*testing/*'",
-    "':(exclude)*.pyc'", "':(exclude)*__pycache__/*'", "':(exclude)*.egg-info/*'",
-    "':(exclude)node_modules/*'", "':(exclude)*.log'",
+    "':(exclude,glob)**/test_*'", "':(exclude,glob)**/*_test.go'",
+    "':(exclude,glob)**/*_test.py'", "':(exclude,glob)**/*_test.js'",
+    "':(exclude,glob)**/*.test.*'", "':(exclude,glob)**/*.spec.*'",
+    "':(exclude,glob)**/test/**'", "':(exclude,glob)**/tests/**'",
+    "':(exclude,glob)**/testing/**'", "':(exclude,glob)**/__tests__/**'",
+    "':(exclude,glob)**/*.pyc'", "':(exclude,glob)**/__pycache__/**'",
+    "':(exclude,glob)**/*.egg-info/**'", "':(exclude,glob)**/node_modules/**'",
+    "':(exclude,glob)**/*.log'",
 ]
 
 
@@ -269,9 +279,9 @@ echo "===DIFF_END==="
             patch += "\n"
 
     agent_s = parse_agent_seconds(out)
-    # 容器被超时杀掉时只有 T0 没有 T1，agent_s 是 None。**不能**退回 wall_seconds 冒充
-    # 解题耗时 —— 那是「跑到超时」的长度，不是「解出来用了多久」，混进统计会把中位数
-    # 直接拉爆。宁可留空，让报告里显示成 timeout。
+    # 容器被超时杀掉时只有 T0 没有 T1，agent_s 是 None。**这里**如实留 None，
+    # 不拿 wall_seconds 冒充解题耗时 —— 那是「跑到超时」的长度，不是「解出来用了多久」。
+    # 报告要的那份数在 write_aggregates 里另外补（退回 wall + 打 measured 标记）。
     rec = {
         "instance_id": iid,
         "model_patch": patch,
@@ -295,6 +305,39 @@ echo "===DIFF_END==="
     agent_txt = "TIMEOUT" if rec["_meta"]["seconds"] is None else f"{rec['_meta']['seconds']}s"
     print(f"[done] {iid}  patch={len(patch)}B  agent={agent_txt}  "
           f"turns={rec['_meta']['turns']}  out_tok={rec['_meta']['output_tokens']}", flush=True)
+    return rec
+
+
+def run_one_guarded(inst: dict, args, codex_bin: Path, outdir: Path, lock) -> dict | None:
+    """把 run_one 包起来：单条炸了不许带走整轮。
+
+    ⚠️ ThreadPoolExecutor.map 的异常是在**取结果**时才抛的，一旦抛出，后面所有条目
+    连结果都取不到，收尾的 write_aggregates 也执行不到 —— 跑了十几个小时的 731 条
+    会因为第 400 条 docker 抽风而一份 run_meta.json 都不落地。所以这里兜底：
+    出错就记一条空 patch 的 .pred（下轮续跑会自动重试它），然后接着跑。
+
+    每条跑完顺手重写一次聚合，这样中途 Ctrl-C / 断电，preds.json 和 run_meta.json
+    也是当时为止的全量快照，报告能直接出。写的时候加锁，避免并发下写出半截 JSON。
+    """
+    iid = inst["instance_id"]
+    try:
+        rec = run_one(inst, args, codex_bin, outdir)
+    except Exception as e:  # noqa: BLE001 —— 就是要兜住所有意外
+        rec = None
+        print(f"[error] {iid}  {type(e).__name__}: {e}", flush=True)
+        inst_dir = outdir / iid
+        inst_dir.mkdir(parents=True, exist_ok=True)
+        (inst_dir / f"{iid}.pred").write_text(json.dumps({
+            "instance_id": iid,
+            "model_patch": "",
+            "model_name_or_path": f"codex-cli/{args.model}",
+            "_meta": {"seconds": None, "timed_out": True, "wall_seconds": 0.0,
+                      "pull_seconds": 0.0, "patch_chars": 0, "image": "",
+                      "error": f"{type(e).__name__}: {e}",
+                      **{k: 0 for k in USAGE_FIELDS}, "turns": 0, "total_tokens": 0},
+        }, indent=2, ensure_ascii=False))
+    with lock:
+        write_aggregates(outdir, args)
     return rec
 
 
@@ -339,10 +382,13 @@ def write_aggregates(outdir: Path, args) -> dict:
     inst = {}
     for iid, r in recs.items():
         m = dict(r.get("_meta") or {})
-        # seconds 可能是 None（容器被超时杀掉，只有 T0 没有 T1）。报告里 fmt_secs 会
-        # round(None) 直接 TypeError，所以在这儿就落成 0，另开一个布尔位存真相。
+        # .pred 里的 seconds 可能是 None（容器被超时杀掉，只有 T0 没有 T1）。
+        # 报告里 fmt_secs 会 round(None) 直接 TypeError，必须落成数。
+        # 退回 wall_seconds 而不是 0 —— 口径与 Verified 的 run_codex_agent.py 一致：
+        # 记 0 会让这条从「推理耗时」KPI 里凭空消失，明明烧了 30 分钟却显示没花时间，
+        # 比偏大更误导。是不是容器内实测的，由 seconds_measured_in_container 记着。
         secs = m.get("seconds")
-        m["seconds"] = 0.0 if secs is None else secs
+        m["seconds"] = round(m.get("wall_seconds", 0.0) or 0.0, 1) if secs is None else secs
         m["seconds_measured_in_container"] = secs is not None
         inst[iid] = m
 
@@ -433,9 +479,10 @@ def main() -> int:
     print(f"[run] {len(rows)}/{n_all} instances（跳过已完成 {skipped}）, "
           f"model={args.model}, workers={args.workers}", flush=True)
 
+    lock = threading.Lock()
     if rows:
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            list(ex.map(lambda r: run_one(r, args, codex_bin, outdir), rows))
+            list(ex.map(lambda r: run_one_guarded(r, args, codex_bin, outdir, lock), rows))
 
     # 扫盘汇总，而不是只汇总本轮 —— 中断续跑之后产物依然是全量的。
     meta = write_aggregates(outdir, args)
