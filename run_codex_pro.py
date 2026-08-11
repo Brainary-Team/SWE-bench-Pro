@@ -83,7 +83,11 @@ EXCLUDES = [
     "':(exclude,glob)**/*_test.py'", "':(exclude,glob)**/*_test.js'",
     "':(exclude,glob)**/*.test.*'", "':(exclude,glob)**/*.spec.*'",
     "':(exclude,glob)**/test/**'", "':(exclude,glob)**/tests/**'",
-    "':(exclude,glob)**/testing/**'", "':(exclude,glob)**/__tests__/**'",
+    # ⚠️ 不要加 `**/testing/**`。实测 731 条里有 14 条的 gold patch 改的就是
+    # build/testing/*.go、packages/testing/*.ts 这种**真源码包**（Go 的集成测试辅助库、
+    # TS 的测试工具包），排掉它们那 14 条直接变成做不出来。加上 testing 的话
+    # 误伤面从 8 条涨到 19 条，且有 1 条落在评分用的测试上。
+    "':(exclude,glob)**/__tests__/**'",
     "':(exclude,glob)**/*.pyc'", "':(exclude,glob)**/__pycache__/**'",
     "':(exclude,glob)**/*.egg-info/**'", "':(exclude,glob)**/node_modules/**'",
     "':(exclude,glob)**/*.log'",
@@ -320,24 +324,47 @@ def run_one_guarded(inst: dict, args, codex_bin: Path, outdir: Path, lock) -> di
     也是当时为止的全量快照，报告能直接出。写的时候加锁，避免并发下写出半截 JSON。
     """
     iid = inst["instance_id"]
+    rec = None
+    t0 = time.monotonic()
     try:
         rec = run_one(inst, args, codex_bin, outdir)
     except Exception as e:  # noqa: BLE001 —— 就是要兜住所有意外
-        rec = None
         print(f"[error] {iid}  {type(e).__name__}: {e}", flush=True)
-        inst_dir = outdir / iid
-        inst_dir.mkdir(parents=True, exist_ok=True)
-        (inst_dir / f"{iid}.pred").write_text(json.dumps({
-            "instance_id": iid,
-            "model_patch": "",
-            "model_name_or_path": f"codex-cli/{args.model}",
-            "_meta": {"seconds": None, "timed_out": True, "wall_seconds": 0.0,
-                      "pull_seconds": 0.0, "patch_chars": 0, "image": "",
-                      "error": f"{type(e).__name__}: {e}",
-                      **{k: 0 for k in USAGE_FIELDS}, "turns": 0, "total_tokens": 0},
-        }, indent=2, ensure_ascii=False))
-    with lock:
-        write_aggregates(outdir, args)
+        pred = outdir / iid / f"{iid}.pred"
+        # ⚠️ 只在还没有成果时才写这条墓碑。run_one 是**先写 .pred 再做收尾**的
+        # （--rm-image 的 docker rmi、还有那句 print），收尾阶段抛异常（docker 抽风、
+        # 管道断了）会走到这里 —— 那时候好好的 patch 已经在盘上了，覆盖掉等于把
+        # 跑了半小时、烧了几十万 token 的成果直接抹掉，而且下轮续跑还要再烧一遍。
+        keep = False
+        if pred.is_file():
+            try:
+                keep = bool(json.loads(pred.read_text()).get("model_patch", "").strip())
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+                keep = False
+        if keep:
+            print(f"[error] {iid}  已有非空 patch，保留原 .pred 不覆盖", flush=True)
+        else:
+            pred.parent.mkdir(parents=True, exist_ok=True)
+            pred.write_text(json.dumps({
+                "instance_id": iid,
+                "model_patch": "",
+                "model_name_or_path": f"codex-cli/{args.model}",
+                # wall_seconds 记真实耗时而不是 0：记 0 会让这条从「推理耗时」KPI 里
+                # 凭空消失，和超时那条是同一个坑。
+                "_meta": {"seconds": None, "timed_out": True,
+                          "wall_seconds": round(time.monotonic() - t0, 1),
+                          "pull_seconds": 0.0, "patch_chars": 0, "image": "",
+                          "error": f"{type(e).__name__}: {e}",
+                          **{k: 0 for k in USAGE_FIELDS}, "turns": 0, "total_tokens": 0},
+            }, indent=2, ensure_ascii=False))
+
+    # ⚠️ 这一段自己也要兜住。它每条都跑一次，磁盘写满 / .pred 缺字段都会在这里抛，
+    # 抛出去照样穿过 ThreadPoolExecutor.map 把整轮带走 —— 那前面那层 try 就白加了。
+    try:
+        with lock:
+            write_aggregates(outdir, args)
+    except Exception as e:  # noqa: BLE001
+        print(f"[error] {iid}  汇总失败（不影响继续跑）：{type(e).__name__}: {e}", flush=True)
     return rec
 
 
@@ -361,11 +388,26 @@ def read_preds(outdir: Path) -> dict[str, dict]:
             continue
         try:
             r = json.loads(p.read_text())
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            # 别静默跳过：这条会从 preds.json 和 run_meta.json 里凭空消失，
+            # 表现成「总数怎么少了一条」，找起来很费劲。
+            print(f"[warn] {p} 读不出来（{type(e).__name__}: {e}），本条不计入汇总")
             continue
         if isinstance(r, dict) and r.get("instance_id"):
             recs[r["instance_id"]] = r
     return recs
+
+
+def write_json_atomic(path: Path, obj) -> None:
+    """先写临时文件再 rename。
+
+    write_text 是「先截断再写」，进程死在这个窗口里就留下半截 JSON ——
+    而每条跑完都要重写一次聚合，窗口出现 731 次。rename 在同一文件系统上是原子的，
+    读的人要么看到旧的完整版，要么看到新的完整版。
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False))
+    tmp.replace(path)
 
 
 def write_aggregates(outdir: Path, args) -> dict:
@@ -375,9 +417,12 @@ def write_aggregates(outdir: Path, args) -> dict:
     和 logs/），评测那条路走的是 .pred 目录，两边不互相依赖。
     """
     recs = read_preds(outdir)
-    preds = {iid: {k: r[k] for k in ("instance_id", "model_patch", "model_name_or_path")}
+    # 用 .get：.pred 少字段也只是这一条缺内容，不能让整轮汇总抛 KeyError 崩掉。
+    preds = {iid: {"instance_id": iid,
+                   "model_patch": r.get("model_patch", ""),
+                   "model_name_or_path": r.get("model_name_or_path", "")}
              for iid, r in recs.items()}
-    (outdir / "preds.json").write_text(json.dumps(preds, indent=2, ensure_ascii=False))
+    write_json_atomic(outdir / "preds.json", preds)
 
     inst = {}
     for iid, r in recs.items():
@@ -407,7 +452,7 @@ def write_aggregates(outdir: Path, args) -> dict:
         "totals": totals,
         "instances": inst,
     }
-    (outdir / "run_meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
+    write_json_atomic(outdir / "run_meta.json", meta)
     return meta
 
 
@@ -487,7 +532,7 @@ def main() -> int:
     # 扫盘汇总，而不是只汇总本轮 —— 中断续跑之后产物依然是全量的。
     meta = write_aggregates(outdir, args)
     t = meta["totals"]
-    n_ok = sum(1 for r in read_preds(outdir).values() if r["model_patch"].strip())
+    n_ok = sum(1 for r in read_preds(outdir).values() if r.get("model_patch", "").strip())
     print(f"[done] 非空 patch {n_ok}/{len(meta['instances'])} · "
           f"{t['turns']} turns · 输入 {t['input_tokens']:,}（缓存 {t['cached_input_tokens']:,}）"
           f" · 输出 {t['output_tokens']:,} · 推理累计 {t['seconds'] / 3600:.1f} 小时")

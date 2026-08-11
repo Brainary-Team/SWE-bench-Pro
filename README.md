@@ -132,7 +132,8 @@ DeepSeek 原生就有 `/v1/responses`，**直连即可**，不需要任何中转
 # --reasoning-effort   ''（Codex 内置默认，实测 none）；推理模型改 high
 # --codex-bin          挂进容器的 Linux 二进制
 # --workers            并发数，冒烟固定 1~2，出错好定位
-# --timeout            单条 agent 超时秒数（容器内计时，不含拉镜像）
+# --timeout            单条容器总超时秒数（宿主机计时，卡的是整个 docker run：
+#                      建容器 + agent + 收尾 git diff。拉镜像在计时之外）
 # --pull-timeout       单个镜像预拉超时秒数
 # --rm-image           开关（默认关）：每条跑完删镜像，全量必开
 # --redo-existing      开关（默认关）：重跑已有非空 patch 的条目
@@ -358,9 +359,13 @@ open report_pro.html
   它的 entryscript 没有 `set -e`，`git apply` 的输出只进容器 stdout，
   而容器是 `detach + remove` 起的，日志当场就没了。所以这里只判两件事：
   评测出了 `codex_output.json`，且它存的 patch 快照与推理产物**逐字节相同**。
-  不满足就记应用失败，并在 `eval_pro.json` 里写 `note`：
-  `no_eval_output`（没出结果）或 `stale_eval_output`（复用了旧结果）。
+  不满足就记应用失败，并在 `eval_pro.json` 里写 `note`：`empty_patch`（模型没产出补丁，
+  全量跑里这一档通常是大头）、`no_eval_output`（评测没出结果）、
+  `stale_eval_output`（复用了旧结果）。注意 KPI 的分母是**全部条目**，
+  所以 `patch 应用 300/731` 里那 431 条绝大多数是空 patch，不是「apply 失败」。
   真正的原因去 `codex_stdout.log` / `codex_stderr.log` 和评测那轮的终端输出里翻。
+  另外，判定为 `stale_eval_output` 的条目**一律记作未解决** —— 那份成绩属于上一轮的补丁，
+  不能算这一轮的（口径同 Verified：`resolved = applied and …`）。
 - **`推理` 列对超时的条目显示的是墙钟**，不是解题耗时。容器被超时杀掉时只有起始打点、
   没有结束打点，拿不到净耗时。记 0 会让这条从 KPI 里凭空消失（烧了 30 分钟却显示没花时间），
   所以退回墙钟，口径与 Verified 一致；`run_meta.json` 里的

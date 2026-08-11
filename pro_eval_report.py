@@ -58,12 +58,16 @@ def read_pred(run: Path, iid: str) -> dict:
         print(f"[warn] {iid}: 没有 .pred，当空 patch 处理")
         return {}
     try:
-        return json.loads(p.read_text())
-    except json.JSONDecodeError as e:
+        r = json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
         # 不能静默：读不出来会被当成空 patch，报告里表现成「模型什么都没写」，
         # 而真相是文件坏了。宁可吵一句。
-        print(f"[warn] {iid}: .pred 不是合法 JSON（{e}），当空 patch 处理")
+        print(f"[warn] {iid}: .pred 读不出来（{type(e).__name__}: {e}），当空 patch 处理")
         return {}
+    if not isinstance(r, dict):
+        print(f"[warn] {iid}: .pred 不是对象（{type(r).__name__}），当空 patch 处理")
+        return {}
+    return r
 
 
 def load_prefixes(evaldir: Path) -> dict[str, str]:
@@ -96,19 +100,29 @@ def find_output(evaldir: Path, iid: str, prefix: str | None) -> tuple[dict | Non
         return None, 0.0, None
 
     if prefix is None:
-        outs, diffs = sorted(d.glob("*_output.json")), sorted(d.glob("*_patch.diff"))
+        outs = sorted(d.glob("*_output.json"))
         if len(outs) > 1:
             print(f"[warn] {iid}: 有 {len(outs)} 套评测产物却不知道该认哪个 prefix，"
                   f"取了 {outs[0].name}。给 --prefix 或保证 {evaldir}/patches.json 在")
+        # ⚠️ 快照必须跟着**同一个 prefix** 取，不能另开一把 glob 各取第一个 ——
+        # 上一轮失败的评测会留下孤零零的 <prefix>_patch.diff（快照先写、结果没产出），
+        # 配错对就会把一次正常的跑判成「复用了旧结果」。
+        prefix = outs[0].name[:-len("_output.json")] if outs else None
     else:
         outs = [p for p in [d / f"{prefix}_output.json"] if p.is_file()]
-        diffs = [p for p in [d / f"{prefix}_patch.diff"] if p.is_file()]
+        if not outs and any(d.glob("*_output.json")):
+            print(f"[warn] {iid}: 目录里有评测产物，但没有 {prefix}_output.json —— "
+                  f"prefix 对不上（现有：{[p.name for p in d.glob('*_output.json')]}）")
     if not outs:
         return None, 0.0, None
+    diffs = [p for p in [d / f"{prefix}_patch.diff"] if p.is_file()]
     try:
         data = json.loads(outs[0].read_text())
-    except json.JSONDecodeError as e:
-        print(f"[warn] {iid}: {outs[0].name} 不是合法 JSON（{e}）")
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+        print(f"[warn] {iid}: {outs[0].name} 读不出来（{type(e).__name__}: {e}）")
+        return None, 0.0, None
+    if not isinstance(data, dict):
+        print(f"[warn] {iid}: {outs[0].name} 不是对象（{type(data).__name__}），当没结果处理")
         return None, 0.0, None
     secs = 0.0
     if diffs:
@@ -162,14 +176,19 @@ def build_instance(iid: str, row: dict, run: Path, evaldir: Path,
     stale = False
     if snap is not None:
         try:
-            stale = snap.read_text() != patch
+            # ⚠️ 必须比字节。read_text() 是 universal-newline 模式，会把 \r\n 和单个 \r
+            # 都折成 \n —— 而快照是原样写的。patch 里只要有 CRLF（JS/TS 仓库很常见），
+            # 一次完全正常的评测就会被误判成「复用了旧结果」，patch_applied 跟着翻成 False。
+            stale = snap.read_bytes() != patch.encode()
         except OSError:
             stale = False
         if stale:
             print(f"[warn] {iid}: 评测存的 patch 与推理产物对不上 —— 这条大概率是"
                   f"旧结果被复用了（评测换个干净的 --output-dir，或加 --redo 重跑）")
 
-    rows = output.get("tests") or []
+    # tests 由 1000 份各仓库自己的 parser.py 生成，形状不保证 —— 官方 harness 有
+    # per-future 的 except 兜着，这边不能比它还脆。
+    rows = [t for t in (output.get("tests") or []) if isinstance(t, dict)]
     passed = {t.get("name") for t in rows if t.get("status") == "PASSED"}
     # 非 PASSED 的状态（FAILED / SKIPPED / ERROR）留最后一次出现的，只用于展示。
     other = {t.get("name"): t.get("status") for t in rows if t.get("status") != "PASSED"}
@@ -191,6 +210,12 @@ def build_instance(iid: str, row: dict, run: Path, evaldir: Path,
     if official is not None and iid in official and official[iid] != resolved:
         print(f"[warn] {iid}: 官方判 {official[iid]}，本地重算 {resolved}，以官方为准")
         resolved = official[iid]
+    # 认定复用了旧结果时，这条的成绩**不作数**。口径与 Verified 一致
+    # （local_eval.py: resolved = applied and f2p_ok and p2p_ok）：patch 没落地就不算解出来。
+    # 否则「换个 agent 重跑却复用旧 --output-dir」这个坑只会在副标题里显示 patch 应用 0/N，
+    # 头条的 Resolved 还是上一轮的分数 —— 而那正是这个检查要拦的事故。
+    if stale:
+        resolved = False
 
     res.update(
         # ⚠️ 口径与 Verified 不同，报告里那一列在 Pro 下读作「补丁确实进了这一轮评测」。
@@ -233,9 +258,12 @@ def main() -> int:
     if f.is_file():
         try:
             official = json.loads(f.read_text())
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
             # 别因为一个坏文件把整份报告丢掉 —— 退回本地重算，吵一句就行。
-            print(f"[warn] {f} 不是合法 JSON（{e}），resolved 全部按本地重算")
+            print(f"[warn] {f} 读不出来（{type(e).__name__}: {e}），resolved 全部按本地重算")
+        if official is not None and not isinstance(official, dict):
+            print(f"[warn] {f} 不是 {{instance_id: bool}} 形状，resolved 全部按本地重算")
+            official = None
     else:
         print(f"[warn] 没有 {f}，resolved 全部按本地重算")
 
