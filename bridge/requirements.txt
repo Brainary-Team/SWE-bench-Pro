@@ -1,0 +1,8 @@
+# 中间层（协议桥）的依赖，与主流程的 requirements.txt 完全隔离：
+# 装在 bridge/.venv 里，主 .venv 一个包都不动。
+litellm[proxy]==1.96.0
+
+# ⚠️ 必须钉死。litellm 1.96.0 的 proxy 用了 fastapi.dependencies.utils.get_flat_dependant，
+# 该私有函数在 fastapi 0.140 被删；不钉的话 pip 会装最新版，起 proxy 直接
+# ImportError: cannot import name 'get_flat_dependant'。
+fastapi==0.139.2

@@ -1,0 +1,29 @@
+# ── 环境 ──
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.python-version
+
+# ── setup.sh 拉下来的东西（几百 MB / 上万个文件，不进仓库）──
+codex-bin/
+claude-bin/
+node_modules/
+package.json
+package-lock.json
+SWE-bench_Pro-os/
+
+# ── 数据集快照（24 MB，fetch_dataset.py 一条命令就能重拉）──
+swebench_pro.jsonl
+
+# ── 跑出来的产物 ──
+results/
+work/
+eval_*.json
+report*.html
+logs/
+logs-*.txt
+nohup.out
+
+# ── 系统 ──
+.DS_Store
