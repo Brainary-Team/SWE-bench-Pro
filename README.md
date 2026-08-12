@@ -2,12 +2,14 @@
 
 用 Codex CLI 作为 agent 跑 [SWE-bench Pro](https://huggingface.co/datasets/ScaleAI/SWE-bench_Pro)（公开集 731 条），
 评测走官方 harness，报告与 SWE-bench Verified 那套**完全同款**。
+agent 也可以直接跑在宿主机上（见[宿主机模式](#宿主机模式agent-跑在本机)），评测与报告两段完全共用。
 
 ## 执行流程
 
 ```
 ┌─ 阶段 A 推理（本地容器里跑 Codex）──────────────────────────┐
 │  run_codex_pro.py    ──→ <run>/<iid>/<iid>.pred + logs/ + preds.json + run_meta.json
+│                     换位置：run_codex_pro_host.py（Codex 跑在宿主机，产物同形状）
 └──────────────────────────────────────────────────────────┘
 ┌─ 阶段 B 评测（官方 harness，另起干净容器）────────────────────┐
 │  eval_pro.py         ──→ <eval>/eval_results.json + <iid>/codex_output.json
@@ -28,6 +30,7 @@ agent 在推理容器里干了什么都不会污染评测。
 | `setup.sh` | 一键装环境：虚拟环境 + 依赖 + 官方仓库 + Codex Linux 二进制 + 数据集 + Docker 自检 |
 | `fetch_dataset.py` | 从 HuggingFace 把 731 条拉成 `swebench_pro.jsonl` |
 | `run_codex_pro.py` | 阶段 A：起容器把 Codex 挂进去改代码，收尾 `git diff` 出 patch |
+| `run_codex_pro_host.py` | 换位置：阶段 A 的 Codex 跑在宿主机，靠 `sbx` 桥进容器跑测试，不需要 Linux 二进制 |
 | `eval_pro.py` | 阶段 B：收补丁 + 调官方 `swe_bench_pro_eval.py`（官方仓库一个字节不改） |
 | `pro_eval_report.py` | 阶段 C-1：把官方评测产物翻译成 Verified 的 `eval_report.json` |
 | `make_report.py` | 阶段 C-2：渲染 HTML 报告。**与 SWE-bench Verified 仓库里那份逐字节相同** |
@@ -332,6 +335,203 @@ open report_pro.html
 
 ---
 
+## 宿主机模式：agent 跑在本机
+
+同一个 Codex，只换「agent 进程跑在哪」。用宿主机装的 `codex`（arm64 原生）——
+不必备 Linux 静态二进制（约 297 MB），agent 自己的进程也不用在 Rosetta 模拟的
+x86_64 容器里爬。**评测和报告两段一个字都不用改**：`eval_pro.py` 只认
+`<run>/<iid>/<iid>.pred`，不关心 patch 是谁在哪生成的。
+
+```
+宿主机                                          容器 codexprohost-<iid>（常驻，官方镜像）
+├─ codex exec（arm64 原生，配置全从命令行来）
+├─ work/<iid>/app/ ──────bind mount──────▶ /app     依赖（ansible-test / go / node_modules）
+│     agent 直接编辑这份                              只装在这儿；同一份文件，改完立刻生效
+├─ work/<iid>/sbx ────── docker exec ────▶ 跑 repro / pytest
+└─ git diff → <iid>.pred → eval_pro.py 另起干净容器评测
+```
+
+三条约束缺一不可：**仓库副本必须在宿主机**（agent 要能直接编辑）、**必须 bind-mount
+回容器**（宿主机没有仓库的依赖）、**评测必须另起干净容器**（agent 对测试文件的任何篡改
+都带不进评测）。
+
+**前置**：`codex --version` 有输出即可。这条路用不到 `setup.sh` 拉的 `codex-bin/`，
+也**不用** `codex login` —— 凭据走 `--api-key`，和容器模式同一套 provider 配置。
+
+```bash
+# --workroot          宿主机上放仓库副本的目录，每条一份（ansible 约 350 M）
+# --sandbox           见下面「沙箱」一节，默认 workspace-write
+# --no-network        开关（默认关）：⚠️ 关掉沙箱网络会连 docker.sock 一起挡掉，agent 跑不了测试
+# --codex-home        留空＝<workroot>/.codex-home（全新空目录，不碰你的 ~/.codex）
+# --keep              开关（默认关）：跑完不删常驻容器，便于事后 docker exec 进去看
+# --rm-workdir        开关（默认关）：跑完删宿主机副本，跑全量时基本必开
+# 没有 --codex-bin：agent 不进容器，不需要 Linux 二进制
+# 其余参数与 run_codex_pro.py 同名同义
+python run_codex_pro_host.py \
+  --dataset swebench_pro.jsonl \
+  --instances \
+    instance_ansible__ansible-fb144c44144f8bd3542e71f5db62b6d322c7bd85-vba6da65a0f3baefda7a058ebbd0a8dcafb8512f5 \
+    instance_ansible__ansible-11c1777d56664b1acb56b387a1ad6aeadef1391d-v0f01c69f1e2528b935359cfe578530722bca2c59 \
+  --model deepseek-v4-flash \
+  --provider deepseek \
+  --base-url https://api.deepseek.com/v1 \
+  --api-key sk-你的key \
+  --reasoning-effort '' \
+  --workers 2 --timeout 1800 \
+  -o results/host-smoke
+
+# 后面两段与容器模式完全一样，只是把 --run / --meta 换成这一轮的目录
+python eval_pro.py --dataset swebench_pro.jsonl \
+  --run results/host-smoke --output-dir results/host-smoke-eval --workers 2
+
+python pro_eval_report.py --dataset swebench_pro.jsonl \
+  --run results/host-smoke --eval results/host-smoke-eval -o eval_host_smoke.json
+python make_report.py eval_host_smoke.json \
+  --meta results/host-smoke/run_meta.json --output report_host_smoke.html
+```
+
+产物目录结构与容器模式**逐字段同形状**，`show_codex_run.py` 照常能读。
+`run_meta.json` 里多一个 `agent_location: "host"` 用来和容器模式的产物区分；
+容器模式的 `wall_seconds` 换成了 `prep_seconds`（导出 `/app` + 起容器的耗时），
+`seconds` 只含 codex 进程本身。`model_name_or_path` 是 `codex-cli-host/<model>`
+（容器模式是 `codex-cli/<model>`）。
+
+### `sbx` 桥
+
+宿主机没有仓库的依赖，不给条路 agent 会拿本机 `python` 一路撞墙。所以每条会在
+`work/<iid>/sbx` 生成一个一行脚本，prompt 里明确告诉 agent「要跑东西就调它」：
+
+```bash
+work/<iid>/sbx 'python -m pytest test/units/xxx_test.py -x -q'
+# → docker exec -w /app codexprohost-<iid> bash -c '...'
+```
+
+它还会把命令里的宿主机路径替换成容器里的 `/app` —— agent 天然会拿眼前看到的绝对路径
+拼命令，而那个路径在容器里不存在。草稿文件放 `work/<iid>/app/.agent_scratch/`，
+该目录从 patch 和 `git status` 里双重排除。
+
+实测 agent 确实在用这座桥，而不是纯静态改代码：写 `.agent_scratch/check_tty_ify.py`
+→ `sbx 'python .agent_scratch/check_tty_ify.py'` → `sbx 'PYTHONPATH=/app/lib python -m
+pytest ...'` → 迭代。
+
+### 沙箱
+
+macOS 上 Codex 用 Seatbelt。Seatbelt 把 unix domain socket 算在 `network-outbound` 里，
+所以**不开网络就连不上 docker.sock**，agent 也就跑不了测试。默认 `workspace-write`
++ `network_access=true`：agent 能写工作区、能调 docker，但写不了宿主机 `~/`。
+
+> ⚠️ 默认档里 agent 拿得到 docker socket，理论上能 `docker run -v /:/host` 绕出去。
+> 自家 benchmark 机器可以接受，**别在共享机器上这么跑**。
+
+脚本固定加了 `--ignore-user-config`（不读 `~/.codex/config.toml` 里的 notify 钩子、
+插件、marketplace）、`-c project_doc_max_bytes=0`（不读全局和仓库里的 `AGENTS.md`），
+并且默认把 `CODEX_HOME` 指到一个全新空目录、把 `OPENAI_API_KEY` 从环境里摘掉。
+跑分只吃命令行上给的 model / effort / provider，保证可复现。
+
+### 实测数据
+
+`deepseek-v4-flash` / `effort=default` / `-w 2` / 两条 ansible → **2/2 resolved，13/13 测试通过**：
+
+| Instance | agent | 准备 | turns | 输入（缓存） | 输出（推理） | patch | 评测 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| ansible-11c1777d | 54.9s | 5.7s | 1 | 320,661 (305,920) | 4,683 (825) | 2270B | ✅ F2P 1/1 |
+| ansible-fb144c44 | 104.9s | 4.3s | 1 | 751,242 (726,400) | 10,940 (4,777) | 7261B | ✅ F2P 5/5 · P2P 7/7 |
+
+准备阶段（导出 305 M 的 `/app` + `git reset` + 起容器）5 秒上下，可以忽略。
+
+### 注意
+
+- **⚠️ 数据污染**：镜像的 `/app/.git` 里就有 gold fix，冒烟这两条里有一条 agent
+  真的抄了。这是 Pro 镜像本身的问题，容器模式一样中招，详见
+  [镜像里带着答案](#数据污染镜像里带着答案)。宿主机模式**额外**多送一份便利：
+  `instance_id` 出现在 workdir 路径里，而它本身就含 fix commit 的 hash。
+  另外沙箱网络是全开的，agent 也能直接 `curl` 上游 PR。
+- **磁盘**：每条一份宿主机仓库副本 + 一个常驻容器。Pro 的仓库比 Verified 大得多
+  （JS/TS 仓库带 `node_modules`，可以到几个 G），跑全量务必加 `--rm-workdir`。
+- **并发**：x86_64 镜像在 arm64 上走 Rosetta，`-w` 开太高反而慢；已实测到 `-w 2`。
+- **已验证范围**：只在两条 ansible（python）上端到端跑通。Go / JS / TS 仓库的
+  bind-mount 表现未逐一验证 —— 尤其是 `node_modules` 在 macOS virtiofs 上的读写
+  可能很慢，首次跑建议先单条试。
+- **macOS 大小写不敏感**：仓库里若有仅大小写不同的同名文件，导出到宿主机会互相覆盖。
+  脚本会在导出后打「工作区就不干净」的警告，撞上就改用容器模式跑那一条。
+
+---
+
+## 数据污染：镜像里带着答案
+
+**这是 Pro 数据集本身的问题，不是本仓库哪个脚本引入的，容器模式和宿主机模式一样中招。**
+
+### 现象
+
+官方镜像的 `/app/.git` 是一份**完整 clone**，不是截断到 `base_commit` 的浅历史。
+gold fix 那个 commit 就在里面，而且从 `refs/heads/*`、`refs/tags/*` 正常可达 ——
+推理前那句 `git reset --hard <base_commit>` 只挪了 HEAD，**不删对象、不删 refs**。
+
+而且 `instance_id` 本身就带着那个 commit 的 hash：
+
+```
+instance_ansible__ansible-11c1777d56664b1acb56b387a1ad6aeadef1391d-v0f01c69f1e...
+                          └────────── gold fix 的 commit hash ──────────┘
+   base_commit = e1daaae42af1a4e465edbdad4bb3c6dd7e7110d5   ← 另一个，是解题起点
+```
+
+### 实测（本地 32 个镜像，覆盖 8 个仓库 / 四种语言）
+
+| 检查项 | 结果 |
+| --- | --- |
+| `instance_id` 里含 40 位 hash | **731/731**（全集，纯结构检查） |
+| 那个 hash ≠ `base_commit` | 731/731 |
+| `git reset --hard <base_commit>` 之后，该 commit 仍从 refs 可达 | **32/32** |
+| `git show <hash>` 的文件集 == 数据集的 `patch` + `test_patch` | 28/32 |
+| 剩下 4 条 | 是 merge commit，`git show` 默认不列文件；`git diff <hash>^ <hash>` 照样给出同一份 |
+
+也就是**实测范围内 32/32 都能拿到答案**。
+
+### agent 拿到的是什么
+
+`git show <hash>` 一条命令，同时给出两样东西：
+
+1. **`patch`** —— 源码侧的标准答案，逐行 diff。
+2. **`test_patch`** —— 判分用的那批测试的源码。这个更要命：它等于把
+   `fail_to_pass` 的断言原文摊开，agent 不用猜「什么算通过」，可以直接对着断言写。
+
+冒烟里 `ansible-11c1777d` 那条就是这么过的。日志里的路径是：
+
+```
+git log --all --oneline -S get_locally_reachable_ips -- lib/.../linux.py   ← 拿题面里的符号名做 pickaxe 搜索
+git show 11c1777d56 --stat && git show 11c1777d56 -- lib/.../linux.py
+▸ agent: "This is the exact upstream commit this task is based on (11c1777d56)."
+```
+
+注意它是**靠内容搜索**找到的，没用 `instance_id`。所以容器模式（agent 看不到
+`instance_id`，仓库固定挂在 `/app`）挡不住这条路径 —— 只要 fix commit 从 refs 可达，
+`git log -S`／`git log --all` 就能翻出来。宿主机模式只是**额外**多送一份便利：
+workdir 路径里带 `instance_id`，agent 连搜都不用搜，直接 `git show <那个 hash>`。
+
+### 影响
+
+- **绝对分数偏高，且偏高多少不可知** —— 取决于模型有多"想到"去翻历史。
+  这类分数不能拿去和论文里的数字比。
+- **两种模式之间仍然可比**（同一个洞、同一个量级），同一模型不同 effort 之间也可比。
+- **不同模型之间会被扭曲**：爱翻 git 历史的模型白捡分。这是最需要警惕的一条 ——
+  它会把"谁更会用工具"记成"谁更会解题"。
+
+### 想堵的话
+
+目前**没堵**（堵了就与已跑出来的分数不可比）。要堵，在推理起容器后、跑 agent 前加：
+
+```bash
+cd /app
+git checkout --detach <base_commit>
+git for-each-ref --format='%(refname)' | xargs -r -n1 git update-ref -d   # 删光分支/tag
+git reflog expire --expire=now --all && git gc --prune=now --aggressive   # 真正删掉对象
+```
+
+代价：`git gc` 在大仓库上很慢（几分钟起），而且要在 prompt 里同时禁掉 `curl` 上游
+—— 否则 agent 换条路照样把 PR 抓下来。
+
+---
+
 ## 与 SWE-bench Verified 的差别
 
 同一套流程搬到 Pro，下面这些地方**不一样**，踩过的都在这儿。
@@ -483,6 +683,21 @@ python make_report.py eval_pro.json \
   --meta results/codex-pro/run_meta.json --output report_pro.html
 open report_pro.html
 
+# ❻ 宿主机模式 —— 同一个 Codex，agent 改在本机跑，不用 $CODEX_BIN
+#    产物同形状，❹❺ 两段把 --run/--meta 换成这一轮的目录即可
+python run_codex_pro_host.py --dataset "$DATA" --slice 0:2 \
+  --model "$MODEL" --provider "$PROVIDER" --base-url "$BASE_URL" --api-key "$K" \
+  --reasoning-effort "$EFFORT" \
+  --workers 2 --timeout "$TIMEOUT" --pull-timeout "$PULL_TIMEOUT" \
+  --workroot work -o results/host-smoke          # 跑全量再加 --rm-workdir --rm-image
+
+python eval_pro.py --dataset "$DATA" --run results/host-smoke \
+  --output-dir results/host-smoke-eval --workers 2
+python pro_eval_report.py --dataset "$DATA" \
+  --run results/host-smoke --eval results/host-smoke-eval -o eval_host_smoke.json
+python make_report.py eval_host_smoke.json \
+  --meta results/host-smoke/run_meta.json --output report_host_smoke.html
+
 # ── 运维 ──
 python show_codex_run.py results/codex-pro/logs/<iid>.log --commands --max-output 600
 watch -n 60 'df -h / | tail -1; docker system df | head -3'
@@ -502,3 +717,8 @@ docker image prune -a -f
 | 磁盘瞬间见底 | Pro 镜像平均 5.1 GB。`--rm-image` 必开；评测阶段还会再拉一遍 |
 | `docker run` 报 `no matching manifest` | 漏了 `--platform linux/amd64`（镜像只有 amd64，Docker 默认按本机 arm64 找）。跟 Rosetta 没关系 —— Rosetta 只管跑得快不快，不管拉不拉得到 |
 | 推理正常但 patch 恒为空 | 端点不支持 Responses API。用第三节的 curl 验一下 |
+| 宿主机模式：agent 说 `python` 报 ModuleNotFoundError | 它在宿主机跑而不是走 `sbx` 桥。宿主机没有仓库依赖，正常现象；看日志确认它后来改用 `sbx` 了没有 |
+| 宿主机模式：agent 说 docker `permission denied` | 沙箱网络被关了（`--no-network`）。Seatbelt 把 unix socket 算作网络，关了就连不上 docker.sock |
+| 宿主机模式：patch 里混进复现脚本 | 草稿应落在 `work/<iid>/app/.agent_scratch/`，该目录已从 patch 和 `git status` 双重排除；混进来说明 agent 写到别处了 |
+| 宿主机模式：导出后就报「工作区不干净」 | macOS 的 APFS 默认大小写不敏感，仓库里仅大小写不同的同名文件会互相覆盖。这条 instance 的 patch 会带噪声，换用容器模式跑 |
+| 宿主机模式：`git reset --hard <base_commit> 失败` | 镜像里的 `/app` 和数据集的 `base_commit` 对不上。patch 基线与评测那边不一致，出来的 diff 大概率打不上，这条得单独查 |
