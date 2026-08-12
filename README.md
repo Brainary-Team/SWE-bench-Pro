@@ -18,6 +18,10 @@ agent 也可以直接跑在宿主机上（见[宿主机模式](#宿主机模式a
 │  pro_eval_report.py  ──→ eval_pro.json（Verified 的 schema）
 │  make_report.py      ──→ report_pro.html
 └──────────────────────────────────────────────────────────┘
+┌─ 阶段 D 审计（可选但强烈建议，见「数据污染」一节）────────────┐
+│  audit_contamination.py ──→ audit.json（交叉 A 的日志和 B 的
+│                             判分，算出「干净的 Resolved」）
+└──────────────────────────────────────────────────────────┘
 ```
 
 两个阶段的容器**互不共用**：推理那个容器是给 agent 改代码用的，评测那个是干净起的，
@@ -34,7 +38,7 @@ agent 在推理容器里干了什么都不会污染评测。
 | `eval_pro.py` | 阶段 B：收补丁 + 调官方 `swe_bench_pro_eval.py`（官方仓库一个字节不改） |
 | `pro_eval_report.py` | 阶段 C-1：把官方评测产物翻译成 Verified 的 `eval_report.json` |
 | `make_report.py` | 阶段 C-2：渲染 HTML 报告。**与 SWE-bench Verified 仓库里那份逐字节相同** |
-| `audit_contamination.py` | 扫推理日志，找 agent「抄答案」而不是「解题」的痕迹，算出**干净的 Resolved** |
+| `audit_contamination.py` | 阶段 D：扫推理日志找「抄答案」痕迹（confirmed / history / network 三档），交叉评测结果算出**干净的 Resolved**；也是 `web_search=disabled` 失效的回归警报 |
 | `show_codex_run.py` | 运维：把 Codex 的 JSONL 日志还原成可读的执行过程 |
 | `SWE-bench_Pro-os/` | 官方仓库（setup.sh 自动 clone，钉在 `ca10a60`）。**只读，不改** |
 
