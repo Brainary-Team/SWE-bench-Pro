@@ -50,6 +50,8 @@ from run_codex_pro import (
     INNER_ENV_KEY,
     PROMPT,
     REPO_DIR,
+    STRIP_FAIL,
+    STRIP_OK,
     TOTAL_FIELDS,
     USAGE_FIELDS,
     _unwrap,
@@ -57,6 +59,8 @@ from run_codex_pro import (
     load_dataset_rows,
     parse_usage,
     read_preds,
+    strip_history_script,
+    with_no_cheat,
     write_json_atomic,
 )
 from create_problem_statement import create_problem_statement  # noqa: E402
@@ -128,34 +132,43 @@ def _sub(text: str, old: str, new: str) -> str:
     return text.replace(old, new)
 
 
-def build_prompt(inst: dict, workdir: Path, sbx: Path) -> str:
+def build_prompt(inst: dict, workdir: Path, sbx: Path, no_cheat: bool = True) -> str:
     """从容器版 PROMPT 派生，只多插一段「怎么跑命令」，题面拼法与容器版完全一致。
 
     不另写一份的原因：跑分对比的前提是任务描述逐字一致。`{repo_dir}` 本来就是占位符，
     填宿主机路径即可，不需要像 Verified 那版那样做字符串替换。
+
+    两段外挂都插在 "## Workflow" 之前，先 NO_CHEAT 后 RUNNING_CODE ——
+    容器版只有前者，共用同一个插入点，两边的措辞和顺序才对得上。
     """
     row = {**inst, **{k: _unwrap(inst.get(k, "") or "")
                       for k in ("problem_statement", "requirements", "interface")}}
-    t = _sub(PROMPT, "## Workflow",
+    t = _sub(with_no_cheat(PROMPT, no_cheat), "## Workflow",
              RUNNING_CODE.format(sbx=sbx, workdir=workdir, scratch=SCRATCH,
                                  repo_dir=REPO_DIR) + "## Workflow")
     return t.format(problem=create_problem_statement(row), repo_dir=str(workdir))
 
 
-def export_repo(img: str, platform: str, dest: Path) -> None:
-    """把镜像里的 {REPO_DIR} 原样导出到宿主机 dest。
+def export_repo(img: str, platform: str, dest: Path, prep: str) -> str:
+    """把镜像里的 {REPO_DIR} 导出到宿主机 dest，返回 prep 在容器里的输出。
 
-    用 docker create + docker cp（走 tar 流，保留权限/符号链接），不用 docker run 里 cp
-    到 bind mount —— 后者在 macOS 的 virtiofs 上慢一个量级。
+    prep（对齐 base_commit + 可选的剥离历史）在**导出之前**于容器内执行。顺序不能反：
+    teleport 那类仓库 .git 有 1.1 GB，剥完只剩 102 MB —— 先剥能少拷 1 GB，
+    在 macOS 的 virtiofs 上这是分钟级的差别。
+
+    用 docker cp（走 tar 流，保留权限/符号链接），不用 docker run 里 cp 到 bind mount
+    —— 后者在 macOS 上慢一个量级。
     """
     if dest.exists():
         shutil.rmtree(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    cid = run(["docker", "create", "--platform", platform,
-               "--entrypoint", "/bin/bash", img, "-c", "true"]).stdout.strip()
+    cid = run(["docker", "run", "-d", "--platform", platform,
+               "--entrypoint", "/bin/bash", img, "-c", "sleep infinity"]).stdout.strip()
     if not cid:
-        raise RuntimeError(f"docker create 失败：{img}")
+        raise RuntimeError(f"起导出容器失败：{img}")
     try:
+        p = run(["docker", "exec", "-w", REPO_DIR, cid, "bash", "-c", prep])
+        out = p.stdout + p.stderr
         # `docker cp src/. dst` 的语义是「把 src 的内容放进 dst」，dst 必须已存在
         dest.mkdir(parents=True)
         p = run(["docker", "cp", f"{cid}:{REPO_DIR}/.", str(dest)])
@@ -166,14 +179,29 @@ def export_repo(img: str, platform: str, dest: Path) -> None:
 
     if not (dest / ".git").is_dir():
         raise RuntimeError(f"{dest} 里没有 .git，收不到 patch")
+    return out
+
+
+def build_prep(iid: str, base_commit: str, strip: bool) -> str:
+    """导出前在容器里跑的那段：对齐 base_commit，然后（可选）剥离 git 历史。
+
+    ⚠️ reset 必须在 strip 之前。镜像里 HEAD 停在造数据集时的日期截断点，那是
+    base_commit **之后**很远的地方；先 strip 的话 gc 会把「HEAD 可达」的东西全留下 ——
+    包括 gold fix，等于白剥。
+    """
+    s = f"git reset --hard {base_commit}\n"
+    return s + strip_history_script(iid) if strip else s
 
 
 def prepare_workdir(dest: Path, base_commit: str) -> None:
-    """对齐到 base_commit + 备好草稿目录。与容器版 run.sh 里那两行等价。"""
+    """导出之后在宿主机侧的收尾：核对基线 + 备好草稿目录。
+
+    reset 在容器里已经做过一次，这里再做一次是**当校验用**的（幂等）——
+    对不上 base_commit 意味着 patch 的基线跟评测那边不是同一个，出来的 diff
+    大概率打不上，得当场喊出来而不是等评测阶段莫名其妙全挂。
+    """
     p = run(["git", "-C", str(dest), "reset", "--hard", base_commit])
     if p.returncode != 0:
-        # 容器版是 `>/dev/null 2>&1` 静默吞掉的。这里不吞：对不上 base_commit 意味着
-        # patch 的基线跟评测那边不是同一个，出来的 diff 大概率打不上。
         print(f"  ⚠️  git reset --hard {base_commit[:12]} 失败：{p.stderr.strip()[:200]}",
               file=sys.stderr)
 
@@ -273,7 +301,13 @@ def run_one(inst: dict, args, root: Path, outdir: Path) -> dict:
     # 用 monotonic 不用 time.time()：macOS 休眠时 time.time() 照走、monotonic 冻结，
     # 而 subprocess 的 timeout 内部就是 monotonic，混用会写出自相矛盾的数。
     t_prep = time.monotonic()
-    export_repo(img, args.platform, workdir)
+    strip_out = export_repo(img, args.platform, workdir,
+                            build_prep(iid, inst["base_commit"], args.strip_history))
+    # 只在容器确实回报了 STRIP_OK 时才记 True。宁可少报，也不能在报告里写着
+    # 「已加固」而实际没堵上。
+    stripped = args.strip_history and STRIP_OK in strip_out
+    if args.strip_history and STRIP_FAIL in strip_out:
+        print(f"  ⚠️  {iid} 剥离后 gold fix 仍可读，这条的分数按污染算", file=sys.stderr)
     prepare_workdir(workdir, inst["base_commit"])
     sbx.write_text(SBX.format(container=cname, workdir_q=shlex.quote(str(workdir)),
                               repo_dir_q=shlex.quote(REPO_DIR)))
@@ -282,7 +316,7 @@ def run_one(inst: dict, args, root: Path, outdir: Path) -> dict:
     prep_s = round(time.monotonic() - t_prep, 1)
 
     try:
-        prompt = build_prompt(inst, workdir, sbx)
+        prompt = build_prompt(inst, workdir, sbx, args.no_cheat)
         (root / iid / "prompt.txt").write_text(prompt)   # 实际下发的 prompt，便于复现
 
         env = dict(os.environ)
@@ -331,6 +365,7 @@ def run_one(inst: dict, args, root: Path, outdir: Path) -> dict:
             "exit_code": rc,
             "patch_chars": len(patch),
             "image": img,
+            "history_stripped": stripped,
             **parse_usage(out),
         },
     }
@@ -431,6 +466,11 @@ def write_aggregates(outdir: Path, args) -> dict:
         "agent_location": "host",          # 与容器模式的产物区分开
         "sandbox": args.sandbox + (" +network" if args.network else ""),
         "reasoning_effort": args.reasoning_effort or "default",
+        # 这一轮有没有堵住「从 .git 抄答案」。逐条实际结果在 instances[*].history_stripped，
+        # 两者对不上就说明有条目剥离失败了。
+        "strip_history": args.strip_history,
+        "anticheat_prompt": args.no_cheat,
+        "n_stripped": sum(1 for m in inst.values() if m.get("history_stripped")),
         "subset": args.subset,
         "split": args.split,
         "totals": totals,
@@ -472,6 +512,14 @@ def parse_args():
     ap.add_argument("--keep", action="store_true", help="跑完不删常驻容器，便于事后进去看")
     ap.add_argument("--rm-workdir", action="store_true", help="跑完删掉宿主机上的仓库副本")
     ap.add_argument("--rm-image", action="store_true", help="每条跑完删镜像省磁盘")
+    ap.add_argument("--no-strip-history", dest="strip_history", action="store_false",
+                    help="不剥离 git 历史。⚠️ 官方镜像的 .git 里就有 gold fix 和判分用的"
+                         "测试源码，agent 一条 `git show` 就抄得到，分数会虚高且各模型虚高"
+                         "程度不同。只在复现 2026-08-12 之前跑的旧分数时才关")
+    ap.add_argument("--no-anticheat-prompt", dest="no_cheat", action="store_false",
+                    help="prompt 里不加「别去查上游」那段。⚠️ 模型厂商可能服务端注入 "
+                         "web_search（DeepSeek 实测会），沙箱和出网代理都拦不住，"
+                         "这段是唯一能碰那条通道的杠杆")
     ap.add_argument("--subset", default="pro", help="只写进 run_meta.json，报告表头显示")
     ap.add_argument("--split", default="test", help="同上")
     ap.add_argument("-o", "--output-dir", required=True)
