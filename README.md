@@ -34,6 +34,7 @@ agent 在推理容器里干了什么都不会污染评测。
 | `eval_pro.py` | 阶段 B：收补丁 + 调官方 `swe_bench_pro_eval.py`（官方仓库一个字节不改） |
 | `pro_eval_report.py` | 阶段 C-1：把官方评测产物翻译成 Verified 的 `eval_report.json` |
 | `make_report.py` | 阶段 C-2：渲染 HTML 报告。**与 SWE-bench Verified 仓库里那份逐字节相同** |
+| `audit_contamination.py` | 扫推理日志，找 agent「抄答案」而不是「解题」的痕迹，算出**干净的 Resolved** |
 | `show_codex_run.py` | 运维：把 Codex 的 JSONL 日志还原成可读的执行过程 |
 | `SWE-bench_Pro-os/` | 官方仓库（setup.sh 自动 clone，钉在 `ca10a60`）。**只读，不改** |
 
@@ -140,6 +141,9 @@ DeepSeek 原生就有 `/v1/responses`，**直连即可**，不需要任何中转
 # --pull-timeout       单个镜像预拉超时秒数
 # --rm-image           开关（默认关）：每条跑完删镜像，全量必开
 # --redo-existing      开关（默认关）：重跑已有非空 patch 的条目
+# --no-strip-history      开关（默认**关**，即默认会剥离）：不剥 git 历史。
+#                         ⚠️ 镜像的 .git 里就有 gold fix，不剥的话分数虚高，见「数据污染」一节
+# （公网通道没有开关：web_search 已在 build_codex_cmd 里硬编码 disabled，同见那一节）
 # 冒烟挑了两条 ansible（python，镜像 1.6 GB，是全集里最小的一档）。
 # 想跑数据集头两条就把 --instances 换成 --slice 0:2 —— 但那两条镜像大得多。
 python run_codex_pro.py \
@@ -516,19 +520,129 @@ workdir 路径里带 `instance_id`，agent 连搜都不用搜，直接 `git show
 - **不同模型之间会被扭曲**：爱翻 git 历史的模型白捡分。这是最需要警惕的一条 ——
   它会把"谁更会用工具"记成"谁更会解题"。
 
-### 想堵的话
+> **2026-08-12 起默认加固**（下一节）：git 历史默认剥离、web_search 硬编码关闭。
+> 也就是说：**用默认参数跑出来的分数，与本文档更早版本里记的那些数不可比** ——
+> 早那些是污染分。`--no-strip-history` 只能还原 git 通道；web_search 没有开关，
+> 旧的污染分在现版本上**无法精确复现**（真要复现得 checkout 旧 commit）。
+> 每一轮的状态记在 `run_meta.json` 的 `strip_history` / `web_search` / `n_stripped` 里，
+> 产物是自描述的。
 
-目前**没堵**（堵了就与已跑出来的分数不可比）。要堵，在推理起容器后、跑 agent 前加：
+### 怎么堵（默认全开：剥历史开关 + web_search 硬编码关闭）
+
+两条通道要分开治，机理完全不同。
+
+#### ① git 通道 —— 能彻底堵，已堵
+
+`--strip-history`（默认开，`--no-strip-history` 关掉）。在 `git reset --hard <base_commit>`
+**之后**、跑 agent **之前**执行：
 
 ```bash
-cd /app
-git checkout --detach <base_commit>
-git for-each-ref --format='%(refname)' | xargs -r -n1 git update-ref -d   # 删光分支/tag
-git reflog expire --expire=now --all && git gc --prune=now --aggressive   # 真正删掉对象
+git remote remove origin 2>/dev/null || true
+git for-each-ref --format='delete %(refname)' refs/heads refs/remotes refs/tags | git update-ref --stdin
+rm -f .git/FETCH_HEAD .git/ORIG_HEAD
+git reflog expire --expire=now --all
+git gc --prune=now
+git cat-file -e <fix hash>   # 断言：还读得到就报 STRIP_FAIL
 ```
 
-代价：`git gc` 在大仓库上很慢（几分钟起），而且要在 prompt 里同时禁掉 `curl` 上游
-—— 否则 agent 换条路照样把 PR 抓下来。
+命令取自上游未合的 PR [#94](https://github.com/scaleapi/SWE-bench_Pro-os/pull/94)，末尾那句断言是我们自己加的
+—— fix 的 hash 从 `instance_id` 里就能拿到，直接问「那个 commit 还读不读得到」，
+比 PR #94 按提交日期数未来提交的启发式硬。
+
+**三个必须注意的点：**
+
+1. **顺序不能反。** 镜像里 HEAD 停在造数据集时的日期截断点，那是 base_commit 之后很远的
+   地方。先 strip 的话 `gc` 会把「HEAD 可达」的东西全留下 —— 包括 gold fix，等于白剥。
+2. **`gc --prune=now` 一行都不能少。** 前四行只删指针，对象还在 pack 里，
+   `git show <hash>` 照样读得出来。实测：删光 refs 后 fix **仍可读**，gc 之后才真读不到。
+3. **不必用 `--aggressive`。** 实测普通 gc 已经够，而 `--aggressive` 会慢一个量级。
+
+代价实测 **1~3 秒**（go / js / python / ts 各验一个，最大的 teleport `.git` 1.1G→102M），
+而且 **base_commit 之前的历史一条不少** —— `git log` / `git blame` 照常可用，
+agent 该有的工具没被削。宿主机模式下这一步在**导出之前**于容器里做，顺带少拷几百 MB 到几个 G。
+
+> 评测**不受影响**：官方 harness 自己重新起干净容器、自己 `git reset --hard <base_commit>`，
+> 用的是重新拉的镜像。Cursor 那套还得「打分时把历史还回去」，我们的两段容器本来就分家。
+
+#### ② 公网通道 —— 主犯是 Codex 自带的 `web_search`，已关死
+
+主力泄漏源**不是**厂商偷偷注入，是 **Codex 0.146 起把 web_search 改成了默认开启**：
+不传 `--search` 它也会把 `{"type":"web_search"}` 声明进请求的 `tools` 数组
+（full-access 沙箱下还默认升为 `live`）。DeepSeek 的 `/v1/responses` 按文档语义执行这个
+「客户端声明的服务端工具」——搜索在**服务端**完成，结果直接进模型上下文，
+不以任何可见事件回传。未加固那轮，agent 就是靠它搜到
+`https://patch-diff.githubusercontent.com/raw/ansible/ansible/pull/79018.diff` 的，正是这条题的 gold PR。
+
+诊断过程记一笔，因为**第一版判错了**，错误结论还在本节早期版本里挂过：
+
+1. 表象：从没传 `--search`，日志里却有 `web_search` 事件 → 第一反应「厂商服务端注入，
+   沙箱和出网代理都拦不住」。
+2. 反证：DeepSeek 官方文档明确 web_search 是 **opt-in**（`tools` 里不声明就不搜），与「注入」矛盾。
+3. 实锤：起本地假 API 收 Codex 的请求体 —— 全新 `CODEX_HOME`、没传 `--search`，
+   `tools` 里赫然躺着 `web_search`。宿主机 0.146.0 与容器挂载的 musl 0.146.1 行为一致。
+
+修法（已硬编码进**两份** `build_codex_cmd`，容器版和宿主版各一处，不设开关）：
+
+```
+-c web_search=disabled
+```
+
+- 抓包验证：加上后 `web_search` 从 `tools` 里消失，两个二进制都验过。
+- ⚠️ 旧键 `tools.web_search=false` **无效** —— 压不过新版默认值，必须用顶层新键。
+- 两种模式的 `CODEX_HOME` 都是全新的（宿主机还带 `--ignore-user-config`），
+  CLI 旗标是唯一配置来源，不存在被本地 config.toml 盖掉的路径。
+- 早期版本在 prompt 里加过一段「别去查上游」的反作弊话术兜这条通道，**现已删除**：
+  工具直接从请求里消失，模型看不到也调不了，比「求模型别用」（按 Poolside 实测只能
+  「可测量下降，不能根除」）原子得多。
+
+残余风险，`audit_contamination.py` 继续兜着：
+
+- agent 仍能自己 `curl` github（两种模式网络都通）—— audit 的 `network` 档盯这条；
+  要物理堵死得上出网白名单（容器模式可做：internal 网络 + 只放行 API 的 sidecar 代理）。
+- 若某个中转真在**服务端**注入搜索，客户端配置管不到。所以 audit 的 `web_search`
+  信号关掉后照常保留：再出现，要么这行配置失效（Codex 升级改了键义），要么中转在注入
+  —— 哪种都得停下来查。
+
+### 审计：算出「干净的 Resolved」
+
+`Resolved 多少` 这一个数没法单独看，得同时报「其中多少条是自己做出来的」：
+
+```bash
+python audit_contamination.py --run results/smoke --report eval_smoke.json
+```
+
+三档判定（宁可漏报也不误报，命中的都该人工过一眼）：
+
+| 档 | 判据 | 误报率 |
+| --- | --- | --- |
+| `confirmed` 抄了 | 日志里出现 gold fix 的 commit hash | 基本没有 —— 那个 hash 只可能来自 `.git` 或 `instance_id` |
+| `history` 翻历史 | `git log --all` / `-S`、`git show <hash>`、`git branch -a`、`reflog`、`fsck` | 中：也可能只是在读代码演进 |
+| `network` 查上游 | `curl`/`wget` github、GitHub API、PR/commit 的 `.patch` URL、`web_search` | 中 |
+
+> ⚠️ 脚本里有两处坑是踩出来的，改的时候别踩回去：**找 hash 前必须先把 `instance_id`
+> 从文本里抹掉**（宿主机模式的 workdir 路径里就含着它，不抹 100% 误报）；
+> **容器模式日志尾部 `===DIFF_START===` 包着的 git diff 要剔掉**（那是产物不是动作）。
+
+### 加固前后实测（两条 ansible，deepseek-v4-flash）
+
+| | Resolved | 审计 | patch 大小 | agent 耗时 |
+| --- | --- | --- | --- | --- |
+| 两条通道全开 | **2/2** | 抄了 2 条 | 2270B / 7261B | 55s / 105s |
+| 只堵 git，公网通道全开 | 2/2 | 抄了 1、查上游 1（**改走公网**） | 2270B / 7261B | 143s / 128s |
+| 堵 git + 反作弊 prompt* | **1/2** | **干净 2 条** | 2527B / 1554B | 177s / 106s |
+
+> \* 第三行跑的时候公网通道靠的是 prompt 里一段「别去查上游」的话术 —— 当时还没定位到
+> 泄漏源是 Codex 默认声明的 web_search。现在那段 prompt 已删，换成 `-c web_search=disabled`
+> 直接把工具从请求里移除（见上节），约束只强不弱；表中数据未用新机制重跑，但结论不受影响。
+
+读法：
+
+- git 通道堵上后 agent **立刻改走公网**，分数一点没掉 —— 这就是为什么只堵一半等于没堵。
+- 公网也堵上之后，`ansible-11c1777d` 那条**做不出来了**。它之前一直在抄，100% 是虚的。
+- 干净轮的 patch 大小和污染轮**完全不同**（1554B vs 7261B），是真自己写的。
+- 代价：agent 耗时和输出 token 都涨了约一倍 —— 它得真解题了。
+
+n=2 只能说明方向。Cursor 在 731 条上的量级是 Opus 4.8 Max **87.1% → 73.0%**。
 
 ---
 
@@ -543,6 +657,8 @@ git reflog expire --expire=now --all && git gc --prune=now --aggressive   # 真�
 | 条数 | 500 | 731（go 280 / python 266 / js 165 / ts 20） |
 | 语言 | 全 Python | 四种语言混合 |
 | 仓库路径 | `/testbed` | `/app` |
+| 镜像里的 git 历史 | 官方已加固（`git log --all ^HEAD` = 0，游离对象 0） | **没加固**，gold fix 可读；本仓库自己剥（见[数据污染](#数据污染镜像里带着答案)） |
+| `instance_id` | `sympy__sympy-23534`，是 **PR 编号** | 直接带 **40 位 fix commit hash**，等于把答案的门牌号写在门口 |
 | 镜像 | `swebench/sweb.eval.x86_64.*`，精简 | `jefzda/sweap-images:*`，整仓依赖，平均 5.1 GB |
 | 测试名格式 | `path::test`（pytest） | `file \| title`（JS）、裸标识符（Go）、`path::test`（Python） |
 | 评测粒度 | 逐条测试 + 失败原因 | 逐条测试，**没有失败原因** |
@@ -697,6 +813,9 @@ python pro_eval_report.py --dataset "$DATA" \
   --run results/host-smoke --eval results/host-smoke-eval -o eval_host_smoke.json
 python make_report.py eval_host_smoke.json \
   --meta results/host-smoke/run_meta.json --output report_host_smoke.html
+
+# ❼ 审计：这批分里有多少是抄的（每轮跑完都该看一眼）
+python audit_contamination.py --run results/codex-pro --report eval_pro.json -o audit_pro.json
 
 # ── 运维 ──
 python show_codex_run.py results/codex-pro/logs/<iid>.log --commands --max-output 600

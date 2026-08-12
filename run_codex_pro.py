@@ -94,6 +94,56 @@ EXCLUDES = [
 ]
 
 
+# ── 数据污染：镜像的 .git 里就有 gold fix ────────────────────────────────
+# 官方镜像的 base_dockerfile 是「全深度 clone + git reset --hard <日期截断点>」，
+# 而 reset 只挪分支指针，不删对象、不动 remote-tracking refs 和 tags。于是
+# base_commit 之后的一切（含 gold patch 和判分用的 test_patch）原样留在 /app/.git 里。
+# 本地 32 个镜像实测 32/32 可利用；上游 issue scaleapi/SWE-bench_Pro-os#93 至今未修。
+FIX_HASH_RE = re.compile(r"-([0-9a-f]{40})")
+
+STRIP_OK = "===STRIP_OK==="
+STRIP_FAIL = "===STRIP_FAIL"
+
+
+def fix_commit_hash(iid: str) -> str:
+    """instance_id 里那 40 位 hex 就是 gold fix 的 commit hash（全集 731/731 都带，
+    且无一等于 base_commit）。拿它做剥离后的断言，比上游 PR #94 那个「按 HEAD 提交
+    日期数还有没有更新的提交」的启发式硬 —— 我们直接问「那个 commit 还读不读得到」。"""
+    m = FIX_HASH_RE.search(iid)
+    return m.group(1) if m else ""
+
+
+def strip_history_script(iid: str) -> str:
+    """清掉 base_commit 之后的 git 痕迹，让 agent 抄不到答案。
+
+    命令来自上游未合的 PR scaleapi/SWE-bench_Pro-os#94，末尾多一句我们自己的断言。
+    每一行都不能省（都是实测出来的，见 README「数据污染」一节）：
+
+      remote remove   分支名本身就能透露修法
+      for-each-ref    `git reset --hard` 不动 remote-tracking refs 和 tags，
+                      `git log --all` 顺着它们就能把未来提交全列出来
+      FETCH_HEAD      refs 之外的两个额外入口
+      reflog expire   reflog 泄漏未来提交的 message，常常直接写着修法
+      gc --prune=now  ★ 前四行只删指针。对象还在 pack 里，`git show <hash>` 照样读得出来，
+                      而 hash 从 instance_id 里白送。实测：删光 refs 后 fix 仍可读，
+                      gc 之后才真的读不到。少这一行等于没堵。
+
+    代价实测 1~3 秒（go/js/python/ts 各验过一个，最大的 teleport .git 1.1G→102M），
+    且 base_commit 之前的历史一条不少 —— `git log` / `git blame` 照常可用，
+    agent 该有的工具没被削。
+    """
+    h = fix_commit_hash(iid)
+    check = (f'if git cat-file -e {h} 2>/dev/null; '
+             f'then echo "{STRIP_FAIL} {h} 仍可读==="; else echo "{STRIP_OK}"; fi'
+             if h else f'echo "{STRIP_OK}"')   # 认不出 hash 就只剥离、不断言
+    return f"""git remote remove origin 2>/dev/null || true
+git for-each-ref --format='delete %(refname)' refs/heads refs/remotes refs/tags | git update-ref --stdin
+rm -f .git/FETCH_HEAD .git/ORIG_HEAD
+git reflog expire --expire=now --all
+git gc --prune=now
+{check}"""
+
+
 def _unwrap(s: str) -> str:
     """数据集里 731 条有 328 条的文本字段是**双层 JSON 编码**的，得剥一层。
 
@@ -135,6 +185,13 @@ def build_codex_cmd(args) -> str:
         "-c", f"model_providers.{p}.base_url={shlex.quote(args.base_url)}",
         "-c", f"model_providers.{p}.env_key={INNER_ENV_KEY}",
         "-c", f"model_providers.{p}.wire_api=responses",
+        # Codex 0.146 起 web_search 默认开启（full-access 沙箱下还默认升为 live），
+        # 会把 {"type":"web_search"} 声明进请求的 tools —— DeepSeek 按文档执行这个
+        # 「客户端声明的服务端工具」，agent 就能搜到上游 fix（抓包实锤，两个二进制
+        # 0.146.0/0.146.1 都验过）。这里显式关死。⚠️ 旧键 tools.web_search=false
+        # 压不过新默认，实测无效，必须用这个顶层键。
+        # 防回归：audit_contamination.py 会扫 web_search，关了之后再出现就是这行失效了。
+        "-c", "web_search=disabled",
     ]
     # 容器里的 CODEX_HOME 是全新的，宿主机 ~/.codex/config.toml 一概不生效。
     # 不显式下发就是 Codex 的内置默认（实测 none）。
@@ -214,12 +271,14 @@ def run_one(inst: dict, args, codex_bin: Path, outdir: Path) -> dict:
         (td / "prompt.txt").write_text(prompt)
 
         # git add -N 让新建的源文件也进 diff；EXCLUDES 把测试/草稿挡在外面。
+        # 剥离放在 T0 之前：它是环境准备，不该记进 agent 的解题耗时
+        strip = strip_history_script(iid) + "\n" if args.strip_history else ""
         inner = f"""set -uo pipefail
 mkdir -p /opt/codexhome
 export CODEX_HOME=/opt/codexhome
 cd {REPO_DIR}
 git reset --hard {inst['base_commit']} >/dev/null 2>&1
-echo "===AGENT_T0 $(date +%s.%N)==="
+{strip}echo "===AGENT_T0 $(date +%s.%N)==="
 echo "===CODEX_START==="
 {build_codex_cmd(args)}
 echo "===CODEX_END rc=$?==="
@@ -282,6 +341,12 @@ echo "===DIFF_END==="
         if patch and not patch.endswith("\n"):
             patch += "\n"
 
+    # 只在容器确实回报了 STRIP_OK 时才记 True。容器被超时杀掉、或断言说 fix 还读得到，
+    # 都记 False —— 宁可少报，也不能在报告里写着「已加固」而实际没堵上。
+    stripped = args.strip_history and STRIP_OK in out
+    if args.strip_history and STRIP_FAIL in out:
+        print(f"[warn] {iid}  剥离后 gold fix 仍可读，这条的分数按污染算", flush=True)
+
     agent_s = parse_agent_seconds(out)
     # 容器被超时杀掉时只有 T0 没有 T1，agent_s 是 None。**这里**如实留 None，
     # 不拿 wall_seconds 冒充解题耗时 —— 那是「跑到超时」的长度，不是「解出来用了多久」。
@@ -297,6 +362,7 @@ echo "===DIFF_END==="
             "pull_seconds": pull_s,
             "patch_chars": len(patch),
             "image": img,
+            "history_stripped": stripped,
             **parse_usage(out),
         },
     }
@@ -447,6 +513,11 @@ def write_aggregates(outdir: Path, args) -> dict:
         "base_url": args.base_url,
         "agent": "codex-cli",
         "reasoning_effort": args.reasoning_effort or "default",
+        # 这一轮到底有没有堵住「从 .git 抄答案」。逐条的实际结果在 instances[*] 里，
+        # 这里记的是本轮的意图 —— 两者对不上就说明有条目剥离失败了。
+        "strip_history": args.strip_history,
+        "web_search": "disabled",       # build_codex_cmd 里硬编码关死，这里自描述
+        "n_stripped": sum(1 for m in inst.values() if m.get("history_stripped")),
         "subset": args.subset,
         "split": args.split,
         "totals": totals,
@@ -488,6 +559,10 @@ def parse_args():
     ap.add_argument("--redo-existing", action="store_true",
                     help="默认跳过已有非空 patch 的条目（续跑）；带上就全部重跑")
     ap.add_argument("--rm-image", action="store_true", help="每条跑完删镜像省磁盘")
+    ap.add_argument("--no-strip-history", dest="strip_history", action="store_false",
+                    help="不剥离 git 历史。⚠️ 官方镜像的 .git 里就有 gold fix 和判分用的"
+                         "测试源码，agent 一条 `git show` 就抄得到，分数会虚高且各模型虚高"
+                         "程度不同。只在复现 2026-08-12 之前跑的旧分数时才关")
     ap.add_argument("--subset", default="pro", help="只写进 run_meta.json，报告表头显示")
     ap.add_argument("--split", default="test", help="同上")
     ap.add_argument("-o", "--output-dir", required=True)
