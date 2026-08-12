@@ -60,7 +60,6 @@ from run_codex_pro import (
     parse_usage,
     read_preds,
     strip_history_script,
-    with_no_cheat,
     write_json_atomic,
 )
 from create_problem_statement import create_problem_statement  # noqa: E402
@@ -132,18 +131,15 @@ def _sub(text: str, old: str, new: str) -> str:
     return text.replace(old, new)
 
 
-def build_prompt(inst: dict, workdir: Path, sbx: Path, no_cheat: bool = True) -> str:
+def build_prompt(inst: dict, workdir: Path, sbx: Path) -> str:
     """从容器版 PROMPT 派生，只多插一段「怎么跑命令」，题面拼法与容器版完全一致。
 
     不另写一份的原因：跑分对比的前提是任务描述逐字一致。`{repo_dir}` 本来就是占位符，
     填宿主机路径即可，不需要像 Verified 那版那样做字符串替换。
-
-    两段外挂都插在 "## Workflow" 之前，先 NO_CHEAT 后 RUNNING_CODE ——
-    容器版只有前者，共用同一个插入点，两边的措辞和顺序才对得上。
     """
     row = {**inst, **{k: _unwrap(inst.get(k, "") or "")
                       for k in ("problem_statement", "requirements", "interface")}}
-    t = _sub(with_no_cheat(PROMPT, no_cheat), "## Workflow",
+    t = _sub(PROMPT, "## Workflow",
              RUNNING_CODE.format(sbx=sbx, workdir=workdir, scratch=SCRATCH,
                                  repo_dir=REPO_DIR) + "## Workflow")
     return t.format(problem=create_problem_statement(row), repo_dir=str(workdir))
@@ -259,6 +255,9 @@ def build_codex_cmd(args, workdir: Path) -> list[str]:
            "-c", f"model_providers.{p}.base_url={args.base_url}",
            "-c", f"model_providers.{p}.env_key={INNER_ENV_KEY}",
            "-c", f"model_providers.{p}.wire_api=responses",
+           # Codex 0.146 起 web_search 默认开启，agent 能搜到上游 fix。显式关死，
+           # 机理与验证见容器版 build_codex_cmd 的注释和 README「数据污染」一节。
+           "-c", "web_search=disabled",
            "-s", args.sandbox,
            "-C", str(workdir)]
     if args.sandbox == "workspace-write" and args.network:
@@ -316,7 +315,7 @@ def run_one(inst: dict, args, root: Path, outdir: Path) -> dict:
     prep_s = round(time.monotonic() - t_prep, 1)
 
     try:
-        prompt = build_prompt(inst, workdir, sbx, args.no_cheat)
+        prompt = build_prompt(inst, workdir, sbx)
         (root / iid / "prompt.txt").write_text(prompt)   # 实际下发的 prompt，便于复现
 
         env = dict(os.environ)
@@ -469,7 +468,7 @@ def write_aggregates(outdir: Path, args) -> dict:
         # 这一轮有没有堵住「从 .git 抄答案」。逐条实际结果在 instances[*].history_stripped，
         # 两者对不上就说明有条目剥离失败了。
         "strip_history": args.strip_history,
-        "anticheat_prompt": args.no_cheat,
+        "web_search": "disabled",       # build_codex_cmd 里硬编码关死，这里自描述
         "n_stripped": sum(1 for m in inst.values() if m.get("history_stripped")),
         "subset": args.subset,
         "split": args.split,
@@ -516,10 +515,6 @@ def parse_args():
                     help="不剥离 git 历史。⚠️ 官方镜像的 .git 里就有 gold fix 和判分用的"
                          "测试源码，agent 一条 `git show` 就抄得到，分数会虚高且各模型虚高"
                          "程度不同。只在复现 2026-08-12 之前跑的旧分数时才关")
-    ap.add_argument("--no-anticheat-prompt", dest="no_cheat", action="store_false",
-                    help="prompt 里不加「别去查上游」那段。⚠️ 模型厂商可能服务端注入 "
-                         "web_search（DeepSeek 实测会），沙箱和出网代理都拦不住，"
-                         "这段是唯一能碰那条通道的杠杆")
     ap.add_argument("--subset", default="pro", help="只写进 run_meta.json，报告表头显示")
     ap.add_argument("--split", default="test", help="同上")
     ap.add_argument("-o", "--output-dir", required=True)

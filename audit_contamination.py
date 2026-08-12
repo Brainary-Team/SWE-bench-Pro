@@ -53,8 +53,10 @@ NET_PATTERNS = [
     ("GitHub API", re.compile(r"api\.github\.com/repos/[^\s\"']+/(pulls|commits)")),
     ("拉 PR/commit 的 patch",
      re.compile(r"https?://[^\s\"']*(?:/(?:pull|commit)/[^\s\"']*|\.(?:patch|diff)\b)")),
-    # Codex 的服务端 web_search 工具。在跑分场景里，用了就是风险 ——
-    # 实测容器那轮就是靠它搜到 github.com/.../commit/<sha>.patch 的。
+    # web_search 工具（服务端执行，搜索结果直接进模型上下文）。跑分脚本已用
+    # `-c web_search=disabled` 关死（Codex 0.146 起默认开），所以这个信号正常应为 0 ——
+    # 再出现只有两种可能：关闭开关失效（配置回归），或中转真在服务端注入。
+    # 哪种都是污染风险，照旧计入 network 档。
     ("web_search", re.compile(r"\bweb_search\b")),
 ]
 

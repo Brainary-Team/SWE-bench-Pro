@@ -68,22 +68,6 @@ Implement the change described above.
 Leave your changes uncommitted in the working tree. Do not run `git commit`.
 """
 
-# 插在 PROMPT 的 "## Workflow" 之前。这是**唯一**能碰公网那条泄漏通道的杠杆：
-# 实测 DeepSeek 的 /v1/responses 会**服务端注入** web_search —— 我们没传 `--search`，
-# 日志里却有 4 条 web_search 事件、且 query 是空串（Codex 没执行，只是把结果渲染出来）。
-# 搜索发生在模型厂商那边，结果裹在响应里回来，所以沙箱网络、`--network none`、
-# 出网代理**一个都拦不住**。剩下的只有嘴上说。
-#
-# 效果按 Poolside 的实测是「可测量的下降，但不能根除」。所以它是兜底，不是解决。
-NO_CHEAT = """## Do not look up the reference fix
-This task is derived from a real commit in this project's upstream repository. Locating
-that commit or its pull request — by web search, the GitHub API, the issue tracker, any
-mirror, or the local git history — and copying it does NOT count as solving the task,
-and the result will be discarded. Do not search the web for this change. Implement it
-from the code in {repo_dir} and the description above.
-
-"""
-
 USAGE_FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
                 "output_tokens", "reasoning_output_tokens")
 
@@ -178,26 +162,12 @@ def _unwrap(s: str) -> str:
     return s
 
 
-def with_no_cheat(template: str, enabled: bool) -> str:
-    """把「别去查上游」那段插进 ## Workflow 之前。
-
-    做成外挂而不是直接写进 PROMPT：PROMPT 是两种模式逐字对齐的锚点，加不加这段
-    是**这一轮的旋钮**（记在 run_meta.json 里），不该混进锚点本身。
-    """
-    if not enabled:
-        return template
-    if "## Workflow" not in template:
-        raise RuntimeError("PROMPT 里找不到 '## Workflow'，NO_CHEAT 的插入点要跟着改")
-    return template.replace("## Workflow", NO_CHEAT + "## Workflow", 1)
-
-
-def build_prompt(inst: dict, no_cheat: bool = True) -> str:
+def build_prompt(inst: dict) -> str:
     """题面用官方 helper 拼（problem_statement + Requirements + New interfaces），
     但三个字段先各自剥壳，免得 45% 的题目带着字面 \\n 进 prompt。"""
     row = {**inst, **{k: _unwrap(inst.get(k, "") or "")
                       for k in ("problem_statement", "requirements", "interface")}}
-    return with_no_cheat(PROMPT, no_cheat).format(
-        problem=create_problem_statement(row), repo_dir=REPO_DIR)
+    return PROMPT.format(problem=create_problem_statement(row), repo_dir=REPO_DIR)
 
 
 def build_codex_cmd(args) -> str:
@@ -215,6 +185,13 @@ def build_codex_cmd(args) -> str:
         "-c", f"model_providers.{p}.base_url={shlex.quote(args.base_url)}",
         "-c", f"model_providers.{p}.env_key={INNER_ENV_KEY}",
         "-c", f"model_providers.{p}.wire_api=responses",
+        # Codex 0.146 起 web_search 默认开启（full-access 沙箱下还默认升为 live），
+        # 会把 {"type":"web_search"} 声明进请求的 tools —— DeepSeek 按文档执行这个
+        # 「客户端声明的服务端工具」，agent 就能搜到上游 fix（抓包实锤，两个二进制
+        # 0.146.0/0.146.1 都验过）。这里显式关死。⚠️ 旧键 tools.web_search=false
+        # 压不过新默认，实测无效，必须用这个顶层键。
+        # 防回归：audit_contamination.py 会扫 web_search，关了之后再出现就是这行失效了。
+        "-c", "web_search=disabled",
     ]
     # 容器里的 CODEX_HOME 是全新的，宿主机 ~/.codex/config.toml 一概不生效。
     # 不显式下发就是 Codex 的内置默认（实测 none）。
@@ -287,7 +264,7 @@ def ensure_image(img: str, platform: str, timeout: int) -> float:
 def run_one(inst: dict, args, codex_bin: Path, outdir: Path) -> dict:
     iid = inst["instance_id"]
     img = get_dockerhub_image_uri(iid, args.dockerhub_username, inst.get("repo", ""))
-    prompt = build_prompt(inst, args.no_cheat)
+    prompt = build_prompt(inst)
 
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
@@ -539,7 +516,7 @@ def write_aggregates(outdir: Path, args) -> dict:
         # 这一轮到底有没有堵住「从 .git 抄答案」。逐条的实际结果在 instances[*] 里，
         # 这里记的是本轮的意图 —— 两者对不上就说明有条目剥离失败了。
         "strip_history": args.strip_history,
-        "anticheat_prompt": args.no_cheat,
+        "web_search": "disabled",       # build_codex_cmd 里硬编码关死，这里自描述
         "n_stripped": sum(1 for m in inst.values() if m.get("history_stripped")),
         "subset": args.subset,
         "split": args.split,
@@ -586,10 +563,6 @@ def parse_args():
                     help="不剥离 git 历史。⚠️ 官方镜像的 .git 里就有 gold fix 和判分用的"
                          "测试源码，agent 一条 `git show` 就抄得到，分数会虚高且各模型虚高"
                          "程度不同。只在复现 2026-08-12 之前跑的旧分数时才关")
-    ap.add_argument("--no-anticheat-prompt", dest="no_cheat", action="store_false",
-                    help="prompt 里不加「别去查上游」那段。⚠️ 模型厂商可能服务端注入 "
-                         "web_search（DeepSeek 实测会），沙箱和出网代理都拦不住，"
-                         "这段是唯一能碰那条通道的杠杆")
     ap.add_argument("--subset", default="pro", help="只写进 run_meta.json，报告表头显示")
     ap.add_argument("--split", default="test", help="同上")
     ap.add_argument("-o", "--output-dir", required=True)
