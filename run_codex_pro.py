@@ -6,6 +6,12 @@
         收尾 git diff 出 patch。
   评测：swe_bench_pro_eval.py 自己起另一个干净容器跑测试。两边不共用容器。
 
+防作弊三件套（各堵各的，谁也替代不了谁）：
+  strip_history   镜像自带的 .git 里就有 gold fix → 剥掉（--no-strip-history 可关）
+  egress          容器只能连 --base-url 那一个目的地 → 抄不到公网（--egress off 可关）
+  web_search      服务端执行的搜索工具 → build_codex_cmd 里硬编码关死
+  三者都实测抓到过真实的抄答案行为，见 README「数据污染」一节。
+
 Codex 0.146+ 只认 wire_api=responses —— 端点必须支持 Responses API，不是 Chat Completions。
 DeepSeek 原生就有 /v1/responses，直连即可：
 
@@ -33,6 +39,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+import egress
 
 # 官方仓库保持原样不动，只从它里面 import helper（不写入、不修改）。
 # dont_write_bytecode：不然 import 会在官方仓库里落一个 helper_code/__pycache__。
@@ -261,7 +269,7 @@ def ensure_image(img: str, platform: str, timeout: int) -> float:
     return round(time.time() - t, 1)
 
 
-def run_one(inst: dict, args, codex_bin: Path, outdir: Path) -> dict:
+def run_one(inst: dict, args, codex_bin: Path, outdir: Path, egr: dict | None = None) -> dict:
     iid = inst["instance_id"]
     img = get_dockerhub_image_uri(iid, args.dockerhub_username, inst.get("repo", ""))
     prompt = build_prompt(inst)
@@ -273,9 +281,13 @@ def run_one(inst: dict, args, codex_bin: Path, outdir: Path) -> dict:
         # git add -N 让新建的源文件也进 diff；EXCLUDES 把测试/草稿挡在外面。
         # 剥离放在 T0 之前：它是环境准备，不该记进 agent 的解题耗时
         strip = strip_history_script(iid) + "\n" if args.strip_history else ""
+        # 出网自检也放在 T0 之前，和剥离一样属于环境准备，不该记进解题耗时。
+        # 必须**每条都跑**、而不是只在开跑前验一次：relay 中途挂了、docker 网络被
+        # 改过，只有逐条探针能发现，否则后面几百条会在没防护的情况下静默跑完。
         inner = f"""set -uo pipefail
 mkdir -p /opt/codexhome
 export CODEX_HOME=/opt/codexhome
+{egress.probe_snippet(egr)}
 cd {REPO_DIR}
 git reset --hard {inst['base_commit']} >/dev/null 2>&1
 {strip}echo "===AGENT_T0 $(date +%s.%N)==="
@@ -297,6 +309,7 @@ echo "===DIFF_END==="
         # 还把 usage 记账搅浑。超时后必须显式 docker rm -f。
         cname = f"codexpro-{iid[:50]}-{os.getpid()}"
         cmd = ["docker", "run", "--rm", "--name", cname, "--platform", args.platform,
+               *egress.docker_run_args(egr),
                "-v", f"{codex_bin}:/usr/local/bin/codex:ro",
                "-v", f"{td/'prompt.txt'}:/tmp/prompt.txt:ro",
                "-v", f"{td/'run.sh'}:/tmp/run.sh:ro",
@@ -347,6 +360,13 @@ echo "===DIFF_END==="
     if args.strip_history and STRIP_FAIL in out:
         print(f"[warn] {iid}  剥离后 gold fix 仍可读，这条的分数按污染算", flush=True)
 
+    # 出网探针。容器被超时杀掉、探针根本没跑到，都记 False —— 宁可少报，
+    # 也不能在报告里写着「已隔离」而实际没隔离。
+    egr_ok, egr_why = egress.parse_probe(out)
+    if not egr_ok:
+        print(f"[warn] {iid}  出网自检没过（{egr_why}）—— 这条能上公网抄答案，不可采信",
+              flush=True)
+
     agent_s = parse_agent_seconds(out)
     # 容器被超时杀掉时只有 T0 没有 T1，agent_s 是 None。**这里**如实留 None，
     # 不拿 wall_seconds 冒充解题耗时 —— 那是「跑到超时」的长度，不是「解出来用了多久」。
@@ -363,6 +383,8 @@ echo "===DIFF_END==="
             "patch_chars": len(patch),
             "image": img,
             "history_stripped": stripped,
+            "egress_ok": egr_ok,
+            "egress_why": egr_why,
             **parse_usage(out),
         },
     }
@@ -378,7 +400,8 @@ echo "===DIFF_END==="
     return rec
 
 
-def run_one_guarded(inst: dict, args, codex_bin: Path, outdir: Path, lock) -> dict | None:
+def run_one_guarded(inst: dict, args, codex_bin: Path, outdir: Path, lock,
+                    egr: dict | None = None) -> dict | None:
     """把 run_one 包起来：单条炸了不许带走整轮。
 
     ⚠️ ThreadPoolExecutor.map 的异常是在**取结果**时才抛的，一旦抛出，后面所有条目
@@ -393,7 +416,7 @@ def run_one_guarded(inst: dict, args, codex_bin: Path, outdir: Path, lock) -> di
     rec = None
     t0 = time.monotonic()
     try:
-        rec = run_one(inst, args, codex_bin, outdir)
+        rec = run_one(inst, args, codex_bin, outdir, egr)
     except Exception as e:  # noqa: BLE001 —— 就是要兜住所有意外
         print(f"[error] {iid}  {type(e).__name__}: {e}", flush=True)
         pred = outdir / iid / f"{iid}.pred"
@@ -420,6 +443,9 @@ def run_one_guarded(inst: dict, args, codex_bin: Path, outdir: Path, lock) -> di
                 "_meta": {"seconds": None, "timed_out": True,
                           "wall_seconds": round(time.monotonic() - t0, 1),
                           "pull_seconds": 0.0, "patch_chars": 0, "image": "",
+                          # 炸掉的条目没跑到探针，按「没隔离」记 —— 和 seconds 同一个
+                          # 口径：不确定的时候记成对分数不利的那一侧
+                          "egress_ok": False, "egress_why": "no-probe",
                           "error": f"{type(e).__name__}: {e}",
                           **{k: 0 for k in USAGE_FIELDS}, "turns": 0, "total_tokens": 0},
             }, indent=2, ensure_ascii=False))
@@ -428,7 +454,7 @@ def run_one_guarded(inst: dict, args, codex_bin: Path, outdir: Path, lock) -> di
     # 抛出去照样穿过 ThreadPoolExecutor.map 把整轮带走 —— 那前面那层 try 就白加了。
     try:
         with lock:
-            write_aggregates(outdir, args)
+            write_aggregates(outdir, args, egr)
     except Exception as e:  # noqa: BLE001
         print(f"[error] {iid}  汇总失败（不影响继续跑）：{type(e).__name__}: {e}", flush=True)
     return rec
@@ -476,7 +502,29 @@ def write_json_atomic(path: Path, obj) -> None:
     tmp.replace(path)
 
 
-def write_aggregates(outdir: Path, args) -> dict:
+def egress_label(outdir: Path, args, egr: dict | None) -> str:
+    """这一轮的出网状态，写进 run_meta.json 的 `egress`。
+
+    ⚠️ egr 为 None 有两种情况，不能都记成 "off"：
+      ① 真的 --egress off
+      ② --egress on，但这轮没有要跑的条目（续跑一个已完成的目录），压根没起 relay
+    ②按 "off" 记的话，对着跑完的目录再敲一次命令，收尾汇总就会把上一轮真实的
+    `pinned:api.deepseek.com:443(sni)` 冲成 "off" —— 一份好数据被误标成不可信。
+    所以②沿用盘上已有的值；盘上也没有（全新目录 + 全被跳过）才记 on:no-op。
+    """
+    if egr:
+        return egr["label"]
+    if args.egress == "off":
+        return "off"
+    try:
+        old = json.loads((outdir / "run_meta.json").read_text()).get("egress", "")
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        old = ""
+    # 只沿用「确实起过 relay」的标签，别把上一轮的 off 也继承过来
+    return old if old.startswith("pinned:") else "on:no-op"
+
+
+def write_aggregates(outdir: Path, args, egr: dict | None = None) -> dict:
     """扫盘产出 preds.json + run_meta.json。
 
     preds.json 只是给报告当锚点用（它按 predictions_path 的同级目录找 run_meta.json
@@ -517,6 +565,12 @@ def write_aggregates(outdir: Path, args) -> dict:
         # 这里记的是本轮的意图 —— 两者对不上就说明有条目剥离失败了。
         "strip_history": args.strip_history,
         "web_search": "disabled",       # build_codex_cmd 里硬编码关死，这里自描述
+        # 出网隔离：钉死了哪个目的地，以及有多少条自检没过。
+        # egress_failed_instances > 0 的这一轮不能拿去比分 —— 那些条目能上公网抄。
+        #
+        "egress": egress_label(outdir, args, egr),
+        "egress_failed_instances": sum(1 for m in inst.values()
+                                       if not m.get("egress_ok", False)),
         "n_stripped": sum(1 for m in inst.values() if m.get("history_stripped")),
         "subset": args.subset,
         "split": args.split,
@@ -563,6 +617,12 @@ def parse_args():
                     help="不剥离 git 历史。⚠️ 官方镜像的 .git 里就有 gold fix 和判分用的"
                          "测试源码，agent 一条 `git show` 就抄得到，分数会虚高且各模型虚高"
                          "程度不同。只在复现 2026-08-12 之前跑的旧分数时才关")
+    ap.add_argument("--egress", default="on", choices=["on", "off"],
+                    help="出网收敛。on（默认）＝容器只挂 --internal 网，只能连 --base-url "
+                         "那一个目的地。⚠️ 关掉的话 agent 能直接 "
+                         "`curl github.com/<repo>/commit/<instance_id 里那个 hash>.patch` "
+                         "把 gold fix 连同判分测试一起抄走（本仓 results/smoke 实测抓到过）。"
+                         "只在调试或复现旧分数时才 off，会记进 run_meta.json")
     ap.add_argument("--subset", default="pro", help="只写进 run_meta.json，报告表头显示")
     ap.add_argument("--split", default="test", help="同上")
     ap.add_argument("-o", "--output-dir", required=True)
@@ -596,21 +656,55 @@ def main() -> int:
         rows = [r for r in rows if r["instance_id"] not in done]
     skipped = n_all - len(rows)
 
+    # ── 出网收敛 ──────────────────────────────────────────────────────
+    # 建网 + 起 relay，然后**在真实镜像里**过一遍探针。不通过就拒绝开跑 ——
+    # 带着漏洞跑完 731 条再发现，那一轮的分数是废的，几十小时和 token 全白烧。
+    egr = None
+    if rows and args.egress == "on":
+        try:
+            egr = egress.ensure_egress(args.base_url)
+        except egress.EgressError as exc:
+            print(exc, file=sys.stderr)
+            return 1
+        img0 = get_dockerhub_image_uri(rows[0]["instance_id"], args.dockerhub_username,
+                                       rows[0].get("repo", ""))
+        # 自检那个 docker run 有自己的超时，镜像没在本地会先卡在隐式 pull 上，
+        # Pro 的镜像动辄好几个 G。先按 --pull-timeout 拉下来再验。
+        ensure_image(img0, args.platform, args.pull_timeout)
+        ok, why = egress.selftest(egr, img0)
+        if not ok:
+            print(f"===EGRESS_FAIL=== 出网自检没过（{why}）——防护没生效，拒绝开跑。\n"
+                  f"  relay={egr['relay']} 钉死 {egr['label']}\n"
+                  f"  看日志：docker logs {egr['relay']}\n"
+                  f"  只是想跑通就加 --egress off（会记进 run_meta.json）。", file=sys.stderr)
+            return 1
+        print(f"[egress] {egr['label']} via {egr['relay']}（自检通过）", flush=True)
+    elif args.egress == "off":
+        print("⚠️ --egress off：agent 能自由出网（curl/git/pip 都通），"
+              "可以直接抄 GitHub 上的 gold fix，分数不可采信。", flush=True)
+
     print(f"[run] {len(rows)}/{n_all} instances（跳过已完成 {skipped}）, "
           f"model={args.model}, workers={args.workers}", flush=True)
 
     lock = threading.Lock()
     if rows:
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            list(ex.map(lambda r: run_one_guarded(r, args, codex_bin, outdir, lock), rows))
+            list(ex.map(lambda r: run_one_guarded(r, args, codex_bin, outdir, lock, egr), rows))
 
     # 扫盘汇总，而不是只汇总本轮 —— 中断续跑之后产物依然是全量的。
-    meta = write_aggregates(outdir, args)
+    meta = write_aggregates(outdir, args, egr)
     t = meta["totals"]
     n_ok = sum(1 for r in read_preds(outdir).values() if r.get("model_patch", "").strip())
     print(f"[done] 非空 patch {n_ok}/{len(meta['instances'])} · "
           f"{t['turns']} turns · 输入 {t['input_tokens']:,}（缓存 {t['cached_input_tokens']:,}）"
           f" · 输出 {t['output_tokens']:,} · 推理累计 {t['seconds'] / 3600:.1f} 小时")
+    # 醒目地报出来。埋在 run_meta.json 里没人看，而这个数不为 0 就意味着
+    # 这一轮里有条目能上公网抄答案，分数不能直接拿去比。
+    n_leak = meta["egress_failed_instances"]
+    if n_leak:
+        print(f"  ===EGRESS_FAIL=== {n_leak}/{len(meta['instances'])} 条出网自检没过，"
+              f"这些结果不可采信（逐条看 run_meta.json 的 instances[*].egress_why）",
+              file=sys.stderr)
     return 0
 
 

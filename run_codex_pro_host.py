@@ -21,6 +21,25 @@ eval_pro.py 只认 <run>/<iid>/<iid>.pred，不关心 patch 是谁在哪生成�
   ⑤ 收 patch 用宿主机的 git（容器里 /app 属主是宿主机 uid 501，root 跑 git 会报
      dubious ownership，所以统一在宿主机侧收）
 
+⚠️ 不适合正式跑分：出网收敛（egress.py）在这里失效
+  agent 的 curl / git / pip 跑在**宿主机**上，docker 网络设置对它一点约束都没有。
+  容器版靠 `--network sweb_iso` + 钉死目的地的 relay 把 GitHub / PyPI 全断掉
+  （见 egress.py），这份脚本一条都用不上 —— agent 可以直接：
+      curl https://github.com/<repo>/commit/<fix>.patch
+      pip download <pkg>==<修好的版本> --no-binary :all:
+  拿到答案再「解题」。web_search 虽然已经关死，这条通道原样开着。
+
+  这不是假想：results/host-strip 那轮（已经剥了 .git）的日志里，agent 原地改走公网 ——
+      curl -sL --max-time 30 https://patch-diff.githubusercontent.com/raw/ansible/ansible/pull/79018.diff
+      curl -sL --max-time 20 'https://api.github.com/repos/ansible/ansible/pulls/79018/files?per_page=100'
+  剥离 .git 只是把它逼到另一条通道上，分数照拿。
+
+  所以：这份只用来验证宿主机登录态链路，**不要拿它的分数当数**。
+  要正式跑分用 run_codex_pro.py（容器 + 出网钉死 --egress on）。
+  彻底的修法是把 sbx 从 docker exec 改成文件投递（agent 往 workdir 写请求文件，
+  宿主机守护进程 watch 到就执行、结果写回），这样才能给 codex 开 --no-network
+  而不牺牲跑测试的能力。
+
 用法：
   python run_codex_pro_host.py --dataset swebench_pro.jsonl --slice 0:2 \
       --model deepseek-v4-flash --provider deepseek \
@@ -465,6 +484,10 @@ def write_aggregates(outdir: Path, args) -> dict:
         "agent_location": "host",          # 与容器模式的产物区分开
         "sandbox": args.sandbox + (" +network" if args.network else ""),
         "reasoning_effort": args.reasoning_effort or "default",
+        # ⚠️ 宿主机模式没有出网收敛：agent 的 curl/git/pip 跑在宿主机上，
+        # docker 网络管不着（详见模块 docstring）。字段留着是为了让报告和事后
+        # 审计一眼看出「这轮没防」——别让它和容器模式的分数混在一起比
+        "egress": "unprotected:host-mode",
         # 这一轮有没有堵住「从 .git 抄答案」。逐条实际结果在 instances[*].history_stripped，
         # 两者对不上就说明有条目剥离失败了。
         "strip_history": args.strip_history,
@@ -557,6 +580,11 @@ def main() -> int:
     if not args.redo_existing:
         done = {iid for iid, r in read_preds(outdir).items() if r.get("model_patch", "").strip()}
         rows = [r for r in rows if r["instance_id"] not in done]
+    # 每次都喊一嗓子。这一条埋在 docstring 和 run_meta.json 里没人看，而它决定了
+    # 这轮的分数能不能拿去比 —— 实测 agent 就是在这个模式下 curl 走了上游 PR 的 diff。
+    print("⚠️ 宿主机模式没有出网收敛：agent 的 curl/git/pip 直接通公网，可以抄 "
+          "GitHub 上的 gold fix。这轮的分数只能自己看，不要拿去比 —— "
+          "正式跑分用 run_codex_pro.py（--egress on）。", file=sys.stderr, flush=True)
     print(f"[run] {len(rows)}/{n_all} instances（跳过已完成 {n_all - len(rows)}）, "
           f"agent 在宿主机, model={args.model}, "
           f"effort={args.reasoning_effort or 'default'}, workers={args.workers}", flush=True)
