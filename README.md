@@ -8,8 +8,11 @@ agent 也可以直接跑在宿主机上（见[宿主机模式](#宿主机模式a
 
 ```
 ┌─ 阶段 A 推理（本地容器里跑 Codex）──────────────────────────┐
+│  egress.py ──→ 建 --internal 网 + 起钉死目的地的 relay，先在真实
+│                镜像里过一遍探针，不通过就拒绝开跑
 │  run_codex_pro.py    ──→ <run>/<iid>/<iid>.pred + logs/ + preds.json + run_meta.json
-│                     换位置：run_codex_pro_host.py（Codex 跑在宿主机，产物同形状）
+│                     换位置：run_codex_pro_host.py（Codex 跑在宿主机，产物同形状，
+│                     ⚠️ 出网收敛在那边失效，只用来验链路，分数别拿去比）
 └──────────────────────────────────────────────────────────┘
 ┌─ 阶段 B 评测（官方 harness，另起干净容器）────────────────────┐
 │  eval_pro.py         ──→ <eval>/eval_results.json + <iid>/codex_output.json
@@ -34,7 +37,9 @@ agent 在推理容器里干了什么都不会污染评测。
 | `setup.sh` | 一键装环境：虚拟环境 + 依赖 + 官方仓库 + Codex Linux 二进制 + 数据集 + Docker 自检 |
 | `fetch_dataset.py` | 从 HuggingFace 把 731 条拉成 `swebench_pro.jsonl` |
 | `run_codex_pro.py` | 阶段 A：起容器把 Codex 挂进去改代码，收尾 `git diff` 出 patch |
-| `run_codex_pro_host.py` | 换位置：阶段 A 的 Codex 跑在宿主机，靠 `sbx` 桥进容器跑测试，不需要 Linux 二进制 |
+| `run_codex_pro_host.py` | 换位置：阶段 A 的 Codex 跑在宿主机，靠 `sbx` 桥进容器跑测试，不需要 Linux 二进制。**⚠️ 出网收敛在这里失效，别拿它的分数比** |
+| `egress.py` | 阶段 A 的出网收敛：建 `--internal` 网 + 起钉死目的地的 relay，并在真实镜像里跑探针自检（不通过就拒绝开跑）。见[数据污染](#数据污染镜像里带着答案) |
+| `sni_relay.py` | `egress.py` 起的 relay 本体，按 SNI 放行。**与 SWE-bench Verified 仓库里那份逐字节相同**（内容一致两边就复用同一个 relay 容器，改动请两边同步） |
 | `eval_pro.py` | 阶段 B：收补丁 + 调官方 `swe_bench_pro_eval.py`（官方仓库一个字节不改） |
 | `pro_eval_report.py` | 阶段 C-1：把官方评测产物翻译成 Verified 的 `eval_report.json` |
 | `make_report.py` | 阶段 C-2：渲染 HTML 报告。**与 SWE-bench Verified 仓库里那份逐字节相同** |
@@ -147,7 +152,10 @@ DeepSeek 原生就有 `/v1/responses`，**直连即可**，不需要任何中转
 # --redo-existing      开关（默认关）：重跑已有非空 patch 的条目
 # --no-strip-history      开关（默认**关**，即默认会剥离）：不剥 git 历史。
 #                         ⚠️ 镜像的 .git 里就有 gold fix，不剥的话分数虚高，见「数据污染」一节
-# （公网通道没有开关：web_search 已在 build_codex_cmd 里硬编码 disabled，同见那一节）
+# --egress on|off         默认 on：容器只挂 --internal 网，只能连 --base-url 那一个
+#                         目的地，GitHub / PyPI / Go proxy 全断。⚠️ off 的话 agent 能
+#                         直接 curl 走 gold fix，分数不可采信。同见「数据污染」一节
+# （web_search 没有开关：已在 build_codex_cmd 里硬编码 disabled，同见那一节）
 # 冒烟挑了两条 ansible（python，镜像 1.6 GB，是全集里最小的一档）。
 # 想跑数据集头两条就把 --instances 换成 --slice 0:2 —— 但那两条镜像大得多。
 python run_codex_pro.py \
@@ -451,9 +459,12 @@ macOS 上 Codex 用 Seatbelt。Seatbelt 把 unix domain socket 算在 `network-o
 
 - **⚠️ 数据污染**：镜像的 `/app/.git` 里就有 gold fix，冒烟这两条里有一条 agent
   真的抄了。这是 Pro 镜像本身的问题，容器模式一样中招，详见
-  [镜像里带着答案](#数据污染镜像里带着答案)。宿主机模式**额外**多送一份便利：
-  `instance_id` 出现在 workdir 路径里，而它本身就含 fix commit 的 hash。
-  另外沙箱网络是全开的，agent 也能直接 `curl` 上游 PR。
+  [镜像里带着答案](#数据污染镜像里带着答案)。宿主机模式**额外**多送两份便利：
+  ① `instance_id` 出现在 workdir 路径里，而它本身就含 fix commit 的 hash；
+  ② **出网收敛在这里失效**（agent 的 curl/git/pip 跑在宿主机上，docker 网络管不着），
+  `results/host-strip` 实测到它剥了 `.git` 之后原地改走公网、curl 上游 PR 的 diff。
+  容器模式默认 `--egress on` 已经物理堵死这条，宿主机模式没有等价手段 ——
+  **这份的分数不要和容器模式混在一起比。**
 - **磁盘**：每条一份宿主机仓库副本 + 一个常驻容器。Pro 的仓库比 Verified 大得多
   （JS/TS 仓库带 `node_modules`，可以到几个 G），跑全量务必加 `--rm-workdir`。
 - **并发**：x86_64 镜像在 arm64 上走 Rosetta，`-w` 开太高反而慢；已实测到 `-w 2`。
@@ -525,15 +536,19 @@ workdir 路径里带 `instance_id`，agent 连搜都不用搜，直接 `git show
   它会把"谁更会用工具"记成"谁更会解题"。
 
 > **2026-08-12 起默认加固**（下一节）：git 历史默认剥离、web_search 硬编码关闭。
+> **2026-08-13 起再加一层**：容器模式默认出网收敛（`--egress on`），把「agent 自己
+> curl 上游 patch」这条也物理堵死 —— 前一天的加固只堵了 web_search，实测 agent
+> 会绕过它直接按 `instance_id` 里的 hash 拼 URL 下载。
+>
 > 也就是说：**用默认参数跑出来的分数，与本文档更早版本里记的那些数不可比** ——
-> 早那些是污染分。`--no-strip-history` 只能还原 git 通道；web_search 没有开关，
-> 旧的污染分在现版本上**无法精确复现**（真要复现得 checkout 旧 commit）。
-> 每一轮的状态记在 `run_meta.json` 的 `strip_history` / `web_search` / `n_stripped` 里，
-> 产物是自描述的。
+> 早那些是污染分。`--no-strip-history` / `--egress off` 能分别还原 git 通道和公网通道；
+> web_search 没有开关，旧的污染分在现版本上**无法精确复现**（真要复现得 checkout 旧 commit）。
+> 每一轮的状态记在 `run_meta.json` 的 `strip_history` / `web_search` / `n_stripped` /
+> `egress` / `egress_failed_instances` 里，产物是自描述的。
 
-### 怎么堵（默认全开：剥历史开关 + web_search 硬编码关闭）
+### 怎么堵（默认全开：剥历史 + web_search 关死 + 出网钉死）
 
-两条通道要分开治，机理完全不同。
+两条通道要分开治，机理完全不同 —— 而公网那条自己又分两步（搜索、下载），也得各堵各的。
 
 #### ① git 通道 —— 能彻底堵，已堵
 
@@ -568,7 +583,21 @@ agent 该有的工具没被削。宿主机模式下这一步在**导出之前**�
 > 评测**不受影响**：官方 harness 自己重新起干净容器、自己 `git reset --hard <base_commit>`，
 > 用的是重新拉的镜像。Cursor 那套还得「打分时把历史还回去」，我们的两段容器本来就分家。
 
-#### ② 公网通道 —— 主犯是 Codex 自带的 `web_search`，已关死
+#### ② 公网通道 —— 两条腿走路，`web_search` 关死 + 出网物理钉死
+
+公网通道其实是**两步接力**，得各堵各的，堵一条另一条照样走通：
+
+```
+web_search（服务端搜索）──→ 找到 gold PR 的编号/URL
+        │                                    ↓
+        └──────────────→  agent 自己 curl / python3 urllib 把 diff 拉下来
+                          （这一步用不着 web_search，知道 repo 名和 hash 就够 ——
+                            而 hash 就明晃晃写在 instance_id 里）
+```
+
+实测两步都抓到过，下面分别记。
+
+##### 第一步：`web_search` —— 不是厂商注入，是 Codex 默认开的，已关死
 
 主力泄漏源**不是**厂商偷偷注入，是 **Codex 0.146 起把 web_search 改成了默认开启**：
 不传 `--search` 它也会把 `{"type":"web_search"}` 声明进请求的 `tools` 数组
@@ -599,13 +628,129 @@ agent 该有的工具没被削。宿主机模式下这一步在**导出之前**�
   工具直接从请求里消失，模型看不到也调不了，比「求模型别用」（按 Poolside 实测只能
   「可测量下降，不能根除」）原子得多。
 
-残余风险，`audit_contamination.py` 继续兜着：
+若某个中转真在**服务端**注入搜索，客户端配置管不到。所以 audit 的 `web_search`
+信号关掉后照常保留：再出现，要么这行配置失效（Codex 升级改了键义），要么中转在注入
+—— 哪种都得停下来查。
 
-- agent 仍能自己 `curl` github（两种模式网络都通）—— audit 的 `network` 档盯这条；
-  要物理堵死得上出网白名单（容器模式可做：internal 网络 + 只放行 API 的 sidecar 代理）。
-- 若某个中转真在**服务端**注入搜索，客户端配置管不到。所以 audit 的 `web_search`
-  信号关掉后照常保留：再出现，要么这行配置失效（Codex 升级改了键义），要么中转在注入
-  —— 哪种都得停下来查。
+##### 第二步：agent 自己出网 —— 已用 `egress.py` 物理钉死（容器模式）
+
+**关掉 `web_search` 并不够。** 那只堵了「怎么找到 PR 编号」，没堵「怎么把 diff 拿下来」——
+而后者根本不需要搜索：`instance_id` 里那 40 位 hash 就是 gold fix 的 commit，
+repo 名在数据集里，拼一下就是可下载的 URL。实测抓到的原话：
+
+```bash
+# results/smoke（容器模式，未加固）：直接按 instance_id 里的 hash 拉
+curl -sL https://github.com/ansible/ansible/commit/11c1777d56664b1acb56b387a1ad6aeadef1391d.patch -o upstream.patch
+  → /bin/bash: line 1: curl: command not found        # 这个镜像没有 curl
+python3 -c "import urllib.request; print(urllib.request.urlopen('...11c1777d....patch').read().decode())"
+  → From 11c1777d56664b1acb56b387a1ad6aeadef1391d ...  # 换个工具照样拿到
+
+# results/host-strip（宿主机模式，.git 已剥离）：原地改走公网
+curl -sL https://patch-diff.githubusercontent.com/raw/ansible/ansible/pull/79018.diff
+curl -sL 'https://api.github.com/repos/ansible/ansible/pulls/79018/files?per_page=100'
+```
+
+注意第二例：**剥了 `.git` 之后 agent 只是换了条通道，分数照拿。** 这就是为什么
+`strip_history` 和 `egress` 谁也替代不了谁。另外 `.patch` 里**连判分用的测试改动一起给**，
+和 `git show <hash>` 泄漏的是同一份东西。
+
+**机制（三层，缺一不可，见 `egress.py`）**
+
+| 层 | 做什么 |
+| --- | --- |
+| ① `docker network create --internal sweb_iso` | 无 NAT、无路由出去、DNS 转发也死 |
+| ② relay 容器 | 一头接 `sweb_iso`（内），一头接默认 bridge（外），目的地启动时钉死 |
+| ③ agent 容器 | `--network sweb_iso --add-host <api_host>:<relay 在 iso 里的 IP>` |
+
+不依赖 agent 配合：网络命名空间里只有 relay 一个可达对端。比 `HTTPS_PROXY` 环境变量强
+—— 那玩意 agent 一句 `env -u` 就摘了。
+
+**两个反直觉的坑（都是实测踩出来的）**
+
+1. **不能用域名黑名单。** 日志里 agent 找到过 `gitlab.wolfspyre.io` 上的 ansible 镜像仓库。
+   公网上这种镜像站有的是，黑名单永远补不全。只有「白名单只剩一个目的地」是收敛的。
+2. **不能只钉目的 IP。** 宿主机若跑着 Clash/Surge 这类 TUN 代理，它**按 SNI 路由、不看目的 IP**
+   —— agent 在 `/etc/hosts` 里把 `github.com` 指向 relay 就能拿到真实 GitHub 内容，
+   证书还是 `CN=github.com`、verify ok。所以 relay 必须自己解析 TLS ClientHello 校验 SNI
+   （`sni_relay.py`），SNI 对不上直接断连并打 `DENY` 日志。
+
+**探针：Pro 这边和 Verified 不一样，不能只用 curl**
+
+自检不是查 DNS 就完事 —— SNI 绕过泄漏发生时 `getent hosts github.com` 照样失败
+（看起来「通过」），分数照样悄悄涨回去。所以探针会真的伪造 SNI 去打一次 relay，
+看能不能取到**真实 GitHub 内容**里的固定串。
+
+但 Verified 那份探针是 **curl-only** 的，直接搬过来在 Pro 上会**静默判过**：
+
+| 工具 | 本地 32 个 Pro 镜像里的可用率 |
+| --- | --- |
+| `curl` | **25/32** —— ansible / qutebrowser / protonmail 那几个都没有 |
+| `python3` | **32/32** |
+| `openssl` | 30/32 |
+
+curl 缺席时那份探针里的 `$_c` 恒为空、永远 `!= 200`，于是报 PASS —— 正好命中它自己
+文档里警告的「静默缺失是最坏情况」。而上面那段实测日志显示，**agent 自己在没有 curl 的
+镜像上就换用了 `python3 urllib`**，可见 curl 根本不是必需品。所以本仓的探针改成
+`python3 → curl → openssl` 三选一（python3 版直接在 TLS 层伪造 SNI，比 `curl --resolve`
+更贴近真实攻击面），三个都没有就显式报 `noprobe` 当失败，绝不静默放过。
+
+**两份探针的对照实测**（同一个 qutebrowser 镜像，同一个泄漏环境：`--dns 127.0.0.1`
+让 DNS 死掉，但按 IP + 伪造 SNI 仍能拿到真实 GitHub 内容 —— 正是 Verified 文档里
+警告的那种泄漏）：
+
+| 探针 | 结果 |
+| --- | --- |
+| 本仓（三选一） | `===EGRESS_FAIL leak:https/443,...===` ← 抓到 |
+| Verified（curl-only） | `===EGRESS_OK===` ← **静默放过了真实泄漏** |
+
+所以这一处不是「照搬更省事」的问题：直接搬过来，在 Pro 的 7/32 个镜像上防护形同虚设，
+而且**报告里还会写着「已隔离」**。
+
+**验证（本机实测，flipt 镜像，relay 钉死 `api.deepseek.com:443`）**
+
+| 攻击手法 | 结果 |
+| --- | --- |
+| `getent hosts github.com` | DNS 死 |
+| `curl .../commit/<gold hash>.patch` | `http=000` |
+| `python3 urllib`（无 curl 镜像上 agent 实际用的那条） | `Temporary failure in name resolution` |
+| `git ls-remote` | `Could not resolve host` |
+| 直接打 relay IP + 伪造 `Host` 头 | `http=000` |
+| `/etc/hosts` 投毒 + 伪造 SNI | `http=000`，relay 打出 `DENY sni='raw.githubusercontent.com' != pinned 'api.deepseek.com'` |
+| `pypi.org` | `http=000` |
+| **`api.deepseek.com/v1/models`（正常通道，必须活着）** | **`http=200`** |
+
+加固前后同一条 flipt 题的对照（`audit_contamination.py`）：
+
+| | 未加固（`results/smoke` 同款配置） | 加固后（`results/egress-test`） |
+| --- | --- | --- |
+| 拉到 gold patch | 28,827 B，含判分测试 | 拿不到 |
+| audit「查上游」 | 命中 | **0** |
+| agent 的历史侦查 | `git show <hash>` 出答案 | `git log --all` / `git branch -a` 只到 `d26eba7`＝base_commit，**没有未来提交** |
+| 正常解题 | — | 1 turn / 47,945 输出 token / 12,746 B patch |
+
+**代价与边界**
+
+- agent 装不了任何包（pip / apt / go mod 全废）。Pro 的镜像是整仓依赖装好的，可接受。
+  但不能因此放行 PyPI / `proxy.golang.org` —— 那和 GitHub 是同一条泄漏通道。
+- **覆盖不到 `web_search`**：那是服务端执行的，走的就是 API 通道本身，relay 看不见也拦不住。
+  必须靠上一步的 `-c web_search=disabled`。两件事不能互相替代。
+- **宿主机模式（`run_codex_pro_host.py`）失效**：agent 的 curl/git/pip 跑在宿主机上，
+  docker 网络管不着。那份脚本每次启动都会喊一嗓子，`run_meta.json` 里记
+  `"egress": "unprotected:host-mode"`。**它的分数只能自己看，不要和容器模式混在一起比。**
+  彻底的修法是把 `sbx` 从 `docker exec` 改成文件投递（agent 写请求文件，宿主机守护进程
+  watch 到就执行、结果写回），这样才能给 codex 开 `--no-network` 而不牺牲跑测试的能力。
+
+**记账**：每条实例都会**单独**跑一次探针（不是只在开跑前验一次 —— relay 中途挂了、
+docker 网络被人改过，只有逐条探针能发现）。结果记在 `run_meta.json`：
+
+```jsonc
+"egress": "pinned:api.deepseek.com:443(sni)",   // 钉死了谁
+"egress_failed_instances": 0,                    // 不为 0 这轮就不能拿去比分
+"instances": { "<iid>": { "egress_ok": true, "egress_why": "" } }
+```
+
+自检没过的条目**宁可少报**：容器被超时杀掉、探针没跑到，一律记 `false`，
+绝不在报告里写着「已隔离」而实际没隔离。
 
 ### 审计：算出「干净的 Resolved」
 
@@ -663,6 +808,7 @@ n=2 只能说明方向。Cursor 在 731 条上的量级是 Opus 4.8 Max **87.1% 
 | 仓库路径 | `/testbed` | `/app` |
 | 镜像里的 git 历史 | 官方已加固（`git log --all ^HEAD` = 0，游离对象 0） | **没加固**，gold fix 可读；本仓库自己剥（见[数据污染](#数据污染镜像里带着答案)） |
 | `instance_id` | `sympy__sympy-23534`，是 **PR 编号** | 直接带 **40 位 fix commit hash**，等于把答案的门牌号写在门口 |
+| 出网收敛探针 | curl 一种就够（镜像统一） | 镜像各语言各自带，**curl 只有 25/32**；本仓改用 `python3`（32/32）→ curl → openssl 三选一，都没有则报 `noprobe` |
 | 镜像 | `swebench/sweb.eval.x86_64.*`，精简 | `jefzda/sweap-images:*`，整仓依赖，平均 5.1 GB |
 | 测试名格式 | `path::test`（pytest） | `file \| title`（JS）、裸标识符（Go）、`path::test`（Python） |
 | 评测粒度 | 逐条测试 + 失败原因 | 逐条测试，**没有失败原因** |
