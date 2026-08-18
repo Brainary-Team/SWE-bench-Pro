@@ -8,6 +8,9 @@ __pycache__/
 # ── setup.sh 拉下来的东西（几百 MB / 上万个文件，不进仓库）──
 codex-bin/
 claude-bin/
+# 同样的约定：brainary-codex 自建的两个 musl 二进制（单个 244MB，超 GitHub 100MB
+# 上限）不进仓库，怎么构建 + sha256 校验表见 brainary-codex-bin/README.md
+brainary-codex-bin/brainary-codex-*
 node_modules/
 package.json
 package-lock.json

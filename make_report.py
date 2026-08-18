@@ -4,7 +4,8 @@
 用法: python make_report.py eval_report.json -o report.html
 
 布局：KPI 一行（结果 + 开销）→ 逐条 instance 表格（instance → PASS 情况）。
-每行一个「N 步」按钮，展开该条的执行过程 —— 从 logs/<iid>.log 解析，
+每行一个「N 步」按钮，展开该条的明细；执行过程收在其中一个默认折叠的
+「执行过程 · N 步」折叠框里，与「逐条测试」「patch」同级 —— 从 logs/<iid>.log 解析，
 同时认 Codex 的 JSONL 事件流和 Claude Code 的 stream-json，两种都归一成
 统一的步骤流（命令/消息/思考/改文件/搜索/turn 边界），与 agent 架构无关。
 """
@@ -154,6 +155,7 @@ details[open] > summary .chev::before { content: "▾"; }
 .nolog { font-size: 12px; color: var(--text-muted); margin: 0; }
 .exp-sec { margin-top: 12px; }
 .exp-sec > summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--text-secondary); }
+.exp-sec > .steps { margin-top: 8px; }
 table.tlist { width: 100%; border-collapse: collapse; font-size: 11.5px; margin-top: 8px;
               font-variant-numeric: tabular-nums; }
 table.tlist td { padding: 4px 8px; border-bottom: 1px solid var(--grid); vertical-align: top; }
@@ -592,7 +594,7 @@ def render(rep: dict, meta: dict | None = None,
         row.append(f'<td><button class="ghost xs" data-exp="exp-{i}">'
                    + (f'{n_act} 步' if n_act else '明细') + '</button></td>')
 
-        # 展开区：失败测试 → 步骤流 → 逐条测试 → 最终 patch
+        # 展开区：失败测试 → 执行过程（默认折叠）→ 逐条测试 → 最终 patch
         exp = []
         fails = [t for t in r["tests"] if t["status"] != "PASSED"]
         for t in fails:
@@ -601,7 +603,9 @@ def render(rep: dict, meta: dict | None = None,
                        + (f'<div class="m">{esc(t["detail"])}</div>' if t["detail"] else "")
                        + '</div>')
         if steps:
-            exp.append(steps_html(steps, max_out))
+            # 与「逐条测试」「patch」同级的折叠框；步骤流内容不变，只是默认收起
+            exp.append(f'<details class="exp-sec"><summary>执行过程 · {n_act} 步</summary>'
+                       + steps_html(steps, max_out) + '</details>')
         else:
             exp.append('<p class="nolog">无执行日志</p>')
         tlist = "".join(
