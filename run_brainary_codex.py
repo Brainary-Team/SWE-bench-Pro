@@ -10,11 +10,33 @@
      ⚠️ host 在容器里的文件名必须是 codex-code-mode-host,一个字都不能差:codex 按
      「自身可执行文件同目录 + 固定文件名」查找 host(install-context 的 fallback 逻辑,
      没有环境变量可以覆盖)。挂错名字的症状不是报错,而是 code mode 静默不可用。
-  2. 默认开启 code mode(features.code_mode + features.code_mode_host):JS 编排跑在
-     独立 host 进程里。gpt-5.6-sol 不在内置模型目录,走 fallback 元数据(tool_mode=None),
-     features 开关生效。
-  3. 默认模型配置指向公司 relay:gpt-5.6-sol @ https://relay.lzbrainary.com/v1,
-     reasoning effort high,wire_api=responses。
+  2. 工具面:code mode(exec()/wait)与 bash 等基础工具并存,靠 model_catalog_json。
+     ⚠️ gpt-5.6-sol 在二进制内置模型目录里自带 tool_mode=code_mode_only,而模型元数据
+     的优先级高于 features 开关(core/tools/mod.rs 的 requested_tool_mode 先读
+     model_info.tool_mode)——所以只开 features.code_mode=true 时模型仍然只看得到
+     exec()/wait 两个工具,shell/apply_patch 全被藏掉,bash 只能从 JS 里绕。唯一能改
+     写这份元数据的杠杆是顶层配置 model_catalog_json(整体替换进程内模型目录)。本脚本
+     按 --code-mode 从 brainary-codex-bin/models.json(与二进制同 commit 拷出)派生一份
+     目录挂进容器:on 把 code_mode_only 改成 code_mode(exec() 与 bash/apply_patch 并存),
+     off 改成 direct(纯基础工具,对照组),only 不动(官方元数据原样,只有 exec()/wait)。
+  3. POA(Program of Agent):让模型在跑题过程中自己编写 JS 编排程序并执行,在程序里
+     spawn/wait 子 agent。gpt-5.6-sol 元数据带 multi_agent_version=v2,但 v2 的
+     collaboration__* 工具默认 non_code_mode_only=true → 只在直连工具面可见,code mode
+     的 JS 里调不到。下发 features.multi_agent_v2.non_code_mode_only=false 后,exec()
+     里的 JS 能直接调 tools.collaboration__spawn_agent 等(fork 对 CodeMode 消息走明文
+     的补丁正是为这条路径打的)。子 agent 并发上限 --max-agents(v2 语义:含 root)。
+     子 agent 的模型调用走同一个 provider/relay,出网钉死对它们同样生效。
+  4. 默认模型配置指向公司 relay:gpt-5.6-sol @ https://relay.lzbrainary.com/v1,
+     reasoning effort high,wire_api=responses。web_search 照旧关死(服务端执行,
+     搜得到上游真实 fix,机理见 run_codex_pro.build_codex_cmd 的注释)。
+  5. 执行过程留痕:fork 的 rollout-trace(CODEX_ROLLOUT_TRACE_ROOT)落在 logs/<iid>.trace/。
+     stdout 的 --json 事件流对 code mode 是「盲」的——exec() 单元不出现,JS 里编排的
+     嵌套工具调用与直连调用无法区分(CommandExecutionSource 没有 CodeMode 变体)。
+     trace bundle 才有全量:code_cell_started 带 JS 源码,tool_call_started 的
+     requester.runtime_cell_id 把子工具挂回所在 exec 单元,inference 响应 payload 里有
+     思考/消息。make_report.py 优先读 trace 渲染执行过程(LLM输出/工具/子工具/思考/信息
+     五类标签),没有 trace 的旧日志退回 --json 流。默认裁掉 inference request payload
+     (逐 turn 全量 prompt,O(turns²) 大小,报告用不上);--trace full 保留。
 
 产物形状与 run_codex_pro.py 完全一致(.pred / logs/ / preds.json / run_meta.json),
 评测(eval_pro.py)和报告(pro_eval_report.py + make_report.py)两段原样共用。
@@ -30,6 +52,7 @@ import hashlib
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -45,10 +68,45 @@ import run_codex_pro as base
 # host 的名字是查找协议的一部分,固定死。
 INNER_CODEX = "/usr/local/bin/brainary-codex"
 INNER_HOST = "/usr/local/bin/codex-code-mode-host"
+# 派生出的模型目录在容器里的挂载点(model_catalog_json 要求绝对路径)
+INNER_CATALOG = "/tmp/model_catalog.json"
+# rollout-trace 落点(容器内)。fork 在 CODEX_ROLLOUT_TRACE_ROOT 下建
+# trace-<uuid>-<thread_id>/{manifest.json, trace.jsonl, payloads/N.json},
+# 子 agent 线程写进同一个 bundle(带 thread_id/agent_path 区分)。
+INNER_TRACE = "/tmp/rollout-trace"
+
+# --code-mode → 派生目录里 tool_mode 的目标值。only 不覆盖(None):
+# 官方元数据对 gpt-5.6-sol 本来就是 code_mode_only,这就是 only 想要的。
+TOOL_MODE_OVERRIDE = {"on": "code_mode", "only": None, "off": "direct"}
+
+
+def build_model_catalog(args, models_json: Path) -> str | None:
+    """按 --code-mode 从 vendored models.json 派生 model_catalog_json 的内容。
+
+    动机见文件头第 2 点:模型元数据里的 tool_mode 压过 features 开关,gpt-5.6-sol
+    自带 code_mode_only → 模型只看得到 exec()/wait。model_catalog_json 是唯一能
+    覆盖这份元数据的配置。只改 tool_mode 一个字段,context_window /
+    multi_agent_version=v2 / 模型指令模板等其余元数据原样保留(整份文件都是从
+    构建二进制的同一 commit 拷出来的,serde 的 deny_unknown_fields 不会炸)。
+    """
+    target = TOOL_MODE_OVERRIDE[args.code_mode]
+    if target is None:
+        return None
+    catalog = json.loads(models_json.read_text())
+    for m in catalog.get("models", []):
+        # 只动声明了 code_mode_only 的条目。tool_mode 缺省(None)的条目本来就由
+        # features 开关决定,不需要覆盖;direct 的条目保持官方语义。
+        if m.get("tool_mode") == "code_mode_only":
+            m["tool_mode"] = target
+    if args.model not in {m.get("slug") for m in catalog.get("models", [])}:
+        print(f"⚠️ {args.model} 不在 {models_json.name} 里:tool_mode 覆盖对它不生效,"
+              f"将走 fallback 元数据(tool_mode=None,由 features 开关决定)",
+              file=sys.stderr)
+    return json.dumps(catalog)
 
 
 def build_codex_cmd(args) -> str:
-    """与 run_codex_pro 同构;差异只有:入口叫 brainary-codex,多了 code mode 开关。"""
+    """与 run_codex_pro 同构;差异只有:入口叫 brainary-codex,多了工具面/POA 的配置下发。"""
     p = args.provider
     parts = [
         "brainary-codex", "exec",
@@ -66,22 +124,67 @@ def build_codex_cmd(args) -> str:
         # code mode 是实验特性,把「实验特性已开启」横幅从事件流里压掉
         "-c", "suppress_unstable_features_warning=true",
     ]
+    if args.catalog_text is not None:
+        # 覆盖进程内模型目录,把 gpt-5.6-sol 的 tool_mode 从 code_mode_only 改掉
+        # (见 build_model_catalog)。这是模型能看到 bash 等基础工具的关键。
+        parts += ["-c", f"model_catalog_json={INNER_CATALOG}"]
     if args.code_mode == "on":
-        # CodeMode 暴露 code mode 工具面,CodeModeHost 让会话跑在独立 host 进程
+        # features 开关只对「不在模型目录里」的模型生效(fallback 元数据 tool_mode=None);
+        # 在目录里的模型(如 gpt-5.6-sol)由上面的 catalog 覆盖决定。两个都下发,
+        # 换模型跑分时行为才一致。CodeModeHost 让 JS 跑在独立 host 进程
         # (不开 host 的话 thread manager 给 DisabledCodeModeSessionProvider,
         # code mode 会静默退回 Direct 工具面,等于白挂了 host 二进制)
         parts += ["-c", "features.code_mode=true", "-c", "features.code_mode_host=true"]
     elif args.code_mode == "only":
         # CodeModeOnly 隐含 CodeMode,模型只看得到 exec/wait,无静默回退
         parts += ["-c", "features.code_mode_only=true", "-c", "features.code_mode_host=true"]
+    if args.code_mode != "off":
+        # POA:v2 的 collaboration__* 工具默认 non_code_mode_only=true,只在直连
+        # 工具面可见;关掉之后 exec() 里的 JS 才能 tools.collaboration__spawn_agent
+        # 编排子 agent —— 「模型自己写 POA 程序并执行」靠的就是这一条。
+        parts += ["-c", "features.multi_agent_v2.non_code_mode_only=false"]
+        # v2 语义:并发线程数**含 root**,内置默认 4(=root+3 个子 agent)
+        parts += ["-c", f"features.multi_agent_v2.max_concurrent_threads_per_session={args.max_agents}"]
     if args.reasoning_effort:
         parts += ["-c", f"model_reasoning_effort={shlex.quote(args.reasoning_effort)}"]
     parts += ["-m", shlex.quote(args.model), "-", "< /tmp/prompt.txt"]
     return " ".join(parts)
 
 
+def prune_trace_requests(trace_dir: Path) -> None:
+    """把 trace bundle 里 inference 的 request payload 删掉,只留报告要用的部分。
+
+    request payload 是发给模型的完整请求体——每个 turn 带全量对话前缀,O(turns²)
+    字符,几十个 turn 就是几十 MB/条。报告只消费 response payload(思考/消息)与
+    tool 的 invocation/result payload。inference_failed / inference_cancelled 的
+    partial_response_payload 是排障证据,留着。trace.jsonl 里的事件行原样保留:
+    只删 payloads/ 下的文件,引用悬空由读方容错(make_report 按「文件存在才读」)。
+    """
+    for bundle in trace_dir.glob("trace-*"):
+        tj = bundle / "trace.jsonl"
+        if not tj.is_file():
+            continue
+        for line in tj.read_text(errors="replace").splitlines():
+            try:
+                p = json.loads(line).get("payload") or {}
+            except json.JSONDecodeError:
+                continue
+            if p.get("type") not in ("inference_started", "compaction_request_started"):
+                continue
+            ref = p.get("request_payload") or {}
+            rel = ref.get("path", "")
+            # payload 路径是 bundle 相对路径("payloads/N.json"),不出 bundle 目录
+            if rel.startswith("payloads/") and ".." not in rel:
+                (bundle / rel).unlink(missing_ok=True)
+
+
+def dir_bytes(d: Path) -> int:
+    return sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) if d.is_dir() else 0
+
+
 def run_one(inst: dict, args, codex_bin: Path, outdir: Path, egr: dict | None = None) -> dict:
-    """copy 自 run_codex_pro.run_one,只动三处:双二进制挂载、命令入口、model_name_or_path。
+    """copy 自 run_codex_pro.run_one,只动五处:双二进制挂载、模型目录/trace 挂载、
+    命令入口、trace 收尾、model_name_or_path。
 
     其余(剥历史 / 逐条出网探针 / 容器命名与超时清理 / .pred 落盘)逐行保持一致 ——
     那些行为都是踩坑踩出来的,见原文件各处注释。
@@ -90,15 +193,30 @@ def run_one(inst: dict, args, codex_bin: Path, outdir: Path, egr: dict | None = 
     img = base.get_dockerhub_image_uri(iid, args.dockerhub_username, inst.get("repo", ""))
     prompt = base.build_prompt(inst)
 
+    logs_dir = outdir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+
+    # 执行过程留痕(见文件头第 5 点)。挂 rw 目录进容器,重跑先清掉旧 bundle,
+    # 不然一条 instance 底下攒出多个 trace-*,报告不知道该读哪个。
+    trace_dir: Path | None = None
+    if args.trace != "off":
+        # resolve():docker -v 只认绝对路径,相对路径会被当成 volume 名拒掉
+        trace_dir = (logs_dir / f"{iid}.trace").resolve()
+        shutil.rmtree(trace_dir, ignore_errors=True)
+        trace_dir.mkdir(parents=True)
+
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         (td / "prompt.txt").write_text(prompt)
+        if args.catalog_text is not None:
+            (td / "model_catalog.json").write_text(args.catalog_text)
 
         strip = base.strip_history_script(iid) + "\n" if args.strip_history else ""
+        trace_env = f"export CODEX_ROLLOUT_TRACE_ROOT={INNER_TRACE}\n" if trace_dir else ""
         inner = f"""set -uo pipefail
 mkdir -p /opt/codexhome
 export CODEX_HOME=/opt/codexhome
-{egress.probe_snippet(egr)}
+{trace_env}{egress.probe_snippet(egr)}
 cd {base.REPO_DIR}
 git reset --hard {inst['base_commit']} >/dev/null 2>&1
 {strip}echo "===AGENT_T0 $(date +%s.%N)==="
@@ -121,10 +239,14 @@ echo "===DIFF_END==="
                "-v", f"{codex_bin}:{INNER_CODEX}:ro",
                "-v", f"{args.host_bin}:{INNER_HOST}:ro",
                "-v", f"{td/'prompt.txt'}:/tmp/prompt.txt:ro",
-               "-v", f"{td/'run.sh'}:/tmp/run.sh:ro",
-               "-e", f"{base.INNER_ENV_KEY}={args.api_key}",
-               "--entrypoint", "/bin/bash",
-               img, "/tmp/run.sh"]
+               "-v", f"{td/'run.sh'}:/tmp/run.sh:ro"]
+        if args.catalog_text is not None:
+            cmd += ["-v", f"{td/'model_catalog.json'}:{INNER_CATALOG}:ro"]
+        if trace_dir is not None:
+            cmd += ["-v", f"{trace_dir}:{INNER_TRACE}"]
+        cmd += ["-e", f"{base.INNER_ENV_KEY}={args.api_key}",
+                "--entrypoint", "/bin/bash",
+                img, "/tmp/run.sh"]
 
         pull_s = base.ensure_image(img, args.platform, args.pull_timeout)
 
@@ -142,8 +264,6 @@ echo "===DIFF_END==="
 
     inst_dir = outdir / iid
     inst_dir.mkdir(parents=True, exist_ok=True)
-    logs_dir = outdir / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
     (logs_dir / f"{iid}.log").write_text(out)
 
     patch = ""
@@ -162,6 +282,12 @@ echo "===DIFF_END==="
         print(f"[warn] {iid}  出网自检没过（{egr_why}）—— 这条能上公网抄答案，不可采信",
               flush=True)
 
+    trace_bytes = None
+    if trace_dir is not None:
+        if args.trace == "on":
+            prune_trace_requests(trace_dir)
+        trace_bytes = dir_bytes(trace_dir)
+
     agent_s = base.parse_agent_seconds(out)
     rec = {
         "instance_id": iid,
@@ -177,6 +303,7 @@ echo "===DIFF_END==="
             "history_stripped": stripped,
             "egress_ok": egr_ok,
             "egress_why": egr_why,
+            "trace_bytes": trace_bytes,
             **base.parse_usage(out),
         },
     }
@@ -207,8 +334,18 @@ def write_aggregates(outdir: Path, args, egr: dict | None = None) -> dict:
     再补上 brainary 的自描述字段。run_one_guarded 每条都会经由 base 模块调到这里。"""
     meta = _base_write_aggregates(outdir, args, egr)
     meta["agent"] = "brainary-codex"
-    meta["code_mode"] = args.code_mode
+    meta["code_mode"] = args.code_mode           # on / only / off,这轮跑的工具面自描述
+    meta["tools"] = {                             # 工具面细节,事后审计「模型到底看得到什么」
+        # 派生目录写进模型元数据的 tool_mode(None=没覆盖,官方元数据原样)
+        "tool_mode_override": TOOL_MODE_OVERRIDE[args.code_mode],
+        # exec() 里的 JS 能否 spawn 子 agent(non_code_mode_only=false 是否已下发)
+        "poa_in_code_mode": args.code_mode != "off",
+        # v2 语义:含 root。off 模式不下发(collaboration 保持官方默认面)
+        "max_agents": args.max_agents if args.code_mode != "off" else None,
+        "models_json": args.binaries_sha.get("models.json"),
+    }
     meta["binaries"] = args.binaries_sha
+    meta["trace"] = args.trace                    # 执行过程留痕:on(裁request)/full/off
     base.write_json_atomic(outdir / "run_meta.json", meta)
     return meta
 
@@ -239,9 +376,21 @@ def parse_args():
     ap.add_argument("--host-bin",
                     default="brainary-codex-bin/"
                             "brainary-codex-code-mode-host-x86_64-unknown-linux-musl")
+    ap.add_argument("--models-json", default="brainary-codex-bin/models.json",
+                    help="二进制内置模型目录的副本（与二进制同 commit 拷出），"
+                         "用来派生 model_catalog_json 覆盖 tool_mode")
     ap.add_argument("--code-mode", default="on", choices=["on", "only", "off"],
-                    help="on=code mode + 常规工具并存；only=模型只看得到 exec/wait；"
-                         "off=纯 Direct 工具面（等价官方 codex 行为，用于对照）")
+                    help="on=exec() 写 POA + bash 等基础工具并存（tool_mode 覆盖成 code_mode）；"
+                         "only=模型只看得到 exec/wait（官方元数据对 gpt-5.6-sol 的原样行为）；"
+                         "off=纯 Direct 工具面（tool_mode 覆盖成 direct，无 code mode，对照组）")
+    ap.add_argument("--max-agents", type=int, default=6,
+                    help="POA 子 agent 并发上限（multi_agent v2 语义：含 root，6=root+5；"
+                         "二进制内置默认 4）。--code-mode off 时不下发")
+    ap.add_argument("--trace", default="on", choices=["on", "full", "off"],
+                    help="执行过程留痕到 logs/<iid>.trace/（make_report 用它渲染"
+                         "exec 的 JS 源码与子工具嵌套）。on=默认，跑完裁掉逐 turn 的"
+                         "inference request payload（O(turns²) 大小，报告用不上）；"
+                         "full=全留（排障用）；off=不留痕")
     ap.add_argument("--dockerhub-username", default="jefzda")
     ap.add_argument("--platform", default="linux/amd64", help="官方镜像只有 amd64")
     ap.add_argument("--timeout", type=int, default=1800, help="单实例容器总超时（秒）")
@@ -269,11 +418,23 @@ def main() -> int:
         sys.exit("找不到二进制：\n  " + "\n  ".join(map(str, missing))
                  + "\n先在 brainary-codex 仓库用 musl-gcc 交叉构建，产物拷进 brainary-codex-bin/")
     args.host_bin = host_bin              # run_one 从 args 上取，签名保持与 base 一致
+
+    # 工具面覆盖:on/off 需要派生模型目录(only 用官方元数据,不需要)
+    models_json = Path(args.models_json).resolve()
+    if TOOL_MODE_OVERRIDE[args.code_mode] is not None and not models_json.is_file():
+        sys.exit(f"找不到 {models_json}\n从构建二进制的 brainary-codex commit 拷出:"
+                 f" codex-rs/models-manager/models.json → brainary-codex-bin/models.json\n"
+                 f"(没有它就没法覆盖 tool_mode,gpt-5.6-sol 会退回 code_mode_only,"
+                 f"模型只看得到 exec()/wait)")
+    args.catalog_text = build_model_catalog(args, models_json)
+
     args.api_key = args.api_key or os.environ.get(args.env_key, "")
     if not args.api_key:
         sys.exit(f"没有 API key：加 --api-key sk-...，或 export {args.env_key}=sk-...")
     args.binaries_sha = {codex_bin.name: sha256_prefix(codex_bin),
                          host_bin.name: sha256_prefix(host_bin)}
+    if args.catalog_text is not None:
+        args.binaries_sha["models.json"] = sha256_prefix(models_json)
 
     rows = base.load_dataset_rows(args.dataset)
     if args.instances:
@@ -317,9 +478,12 @@ def main() -> int:
     elif args.egress == "off":
         print("⚠️ --egress off：agent 能自由出网，可直接抄 gold fix，分数不可采信。", flush=True)
 
+    ov = TOOL_MODE_OVERRIDE[args.code_mode]
     print(f"[run] {len(rows)}/{n_all} instances（跳过已完成 {skipped}）, "
-          f"agent=brainary-codex code_mode={args.code_mode}, model={args.model}, "
-          f"workers={args.workers}", flush=True)
+          f"agent=brainary-codex code_mode={args.code_mode}"
+          f"(tool_mode={ov or '官方元数据'}) "
+          f"poa={'on,max_agents=%d' % args.max_agents if args.code_mode != 'off' else 'off'} "
+          f"trace={args.trace}, model={args.model}, workers={args.workers}", flush=True)
     print(f"[run] 二进制: {args.binaries_sha}", flush=True)
 
     lock = threading.Lock()

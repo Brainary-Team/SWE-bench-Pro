@@ -13,6 +13,12 @@ brainary-codex fork 的 musl-gcc 交叉构建产物,SWE-bench 容器挂载用。
 | brainary-codex-x86_64-unknown-linux-musl | a1e7530b20bf5b085fadeecae5cfa5ab288d4e663806a58299a7aa55f0a61fcb |
 | brainary-codex-code-mode-host-x86_64-unknown-linux-musl | 16f8b24e919d25066c9f9c5288c8716adab470da5c524cd26b3b67fd57482162 |
 
+models.json 是同一 commit 的 codex-rs/models-manager/models.json 原样拷贝(进仓库)。
+run_brainary_codex.py 用它派生 model_catalog_json,把 gpt-5.6-sol 元数据里的
+tool_mode=code_mode_only 覆盖掉 —— 不覆盖的话模型只看得到 exec()/wait,没有 bash。
+⚠️ 换二进制时必须从同一 commit 重新拷这份文件(元数据 schema 是 deny_unknown_fields,
+跨版本的字段差异会让 catalog 解析直接报错)。
+
 ⚠️ 容器里 host 必须挂成 codex-code-mode-host(同目录固定文件名查找),入口挂成 brainary-codex。
 正式跑分入口: ../run_brainary_codex.py
 
