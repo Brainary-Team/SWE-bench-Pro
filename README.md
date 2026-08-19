@@ -12,7 +12,7 @@ agent 也可以直接跑在宿主机上（见[宿主机模式](#宿主机模式a
 │                镜像里过一遍探针，不通过就拒绝开跑
 │  run_codex_pro.py    ──→ <run>/<iid>/<iid>.pred + logs/ + preds.json + run_meta.json
 │                     换 agent：run_brainary_codex.py（brainary-codex fork 二进制，
-│                     exec() 写 POA + bash 等基础工具并存）
+│                     exec() 写 POA + bash 等基础工具并存，rollout-trace 落 logs/<iid>.trace/）
 │                     换位置：run_codex_pro_host.py（Codex 跑在宿主机，产物同形状，
 │                     ⚠️ 出网收敛在那边失效，只用来验链路，分数别拿去比）
 └──────────────────────────────────────────────────────────┘
@@ -39,13 +39,13 @@ agent 在推理容器里干了什么都不会污染评测。
 | `setup.sh` | 一键装环境：虚拟环境 + 依赖 + 官方仓库 + Codex Linux 二进制 + 数据集 + Docker 自检 |
 | `fetch_dataset.py` | 从 HuggingFace 把 731 条拉成 `swebench_pro.jsonl` |
 | `run_codex_pro.py` | 阶段 A：起容器把 Codex 挂进去改代码，收尾 `git diff` 出 patch |
-| `run_brainary_codex.py` | 换 agent：阶段 A 改用 brainary-codex fork 自建二进制（`brainary-codex-bin/`）。工具面靠 `model_catalog_json` 覆盖 `tool_mode`：`--code-mode on`（默认）＝ exec() 写 POA 编排子 agent + bash/apply_patch 等基础工具并存；`only`＝只有 exec()/wait；`off`＝纯基础工具对照组。`web_search` 照旧关死 |
+| `run_brainary_codex.py` | 换 agent：阶段 A 改用 brainary-codex fork 自建二进制（`brainary-codex-bin/`）。工具面靠 `model_catalog_json` 覆盖 `tool_mode`：`--code-mode on`（默认）＝ exec() 写 POA 编排子 agent + bash/apply_patch 等基础工具并存；`only`＝只有 exec()/wait；`off`＝纯基础工具对照组。`web_search` 照旧关死；`--trace` 把 rollout-trace 落到 `logs/<iid>.trace/` 供报告渲染执行过程 |
 | `run_codex_pro_host.py` | 换位置：阶段 A 的 Codex 跑在宿主机，靠 `sbx` 桥进容器跑测试，不需要 Linux 二进制。**⚠️ 出网收敛在这里失效，别拿它的分数比** |
 | `egress.py` | 阶段 A 的出网收敛：建 `--internal` 网 + 起钉死目的地的 relay，并在真实镜像里跑探针自检（不通过就拒绝开跑）。见[数据污染](#数据污染镜像里带着答案) |
 | `sni_relay.py` | `egress.py` 起的 relay 本体，按 SNI 放行。**与 SWE-bench Verified 仓库里那份逐字节相同**（内容一致两边就复用同一个 relay 容器，改动请两边同步） |
 | `eval_pro.py` | 阶段 B：收补丁 + 调官方 `swe_bench_pro_eval.py`（官方仓库一个字节不改） |
 | `pro_eval_report.py` | 阶段 C-1：把官方评测产物翻译成 Verified 的 `eval_report.json` |
-| `make_report.py` | 阶段 C-2：渲染 HTML 报告。**与 SWE-bench Verified 仓库里那份逐字节相同** |
+| `make_report.py` | 阶段 C-2：渲染 HTML 报告。执行过程按五类标签渲染：LLM输出 / 思考（有明文才有）/ 工具（参数+输出，exec 的 JS 参数默认折叠）/ 子工具（exec 里编排的调用，折叠在所属工具下一层，热自旋轮询合并 ×N）/ 信息（脚本标记、turn 用量、错误）。优先读 `logs/<iid>.trace/` 的 rollout-trace（run_brainary_codex `--trace` 落的，才有 exec/子工具/子 agent 结构），旧日志退回 Codex JSONL / Claude stream-json 事件流。**与 SWE-bench Verified 仓库里那份逐字节相同** |
 | `audit_contamination.py` | 阶段 D：扫推理日志找「抄答案」痕迹（confirmed / history / network 三档），交叉评测结果算出**干净的 Resolved**；也是 `web_search=disabled` 失效的回归警报 |
 | `show_codex_run.py` | 运维：把 Codex 的 JSONL 日志还原成可读的执行过程 |
 | `SWE-bench_Pro-os/` | 官方仓库（setup.sh 自动 clone，钉在 `ca10a60`）。**只读，不改** |
