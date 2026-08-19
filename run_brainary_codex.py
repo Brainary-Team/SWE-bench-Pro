@@ -26,6 +26,11 @@
      里的 JS 能直接调 tools.collaboration__spawn_agent 等(fork 对 CodeMode 消息走明文
      的补丁正是为这条路径打的)。子 agent 并发上限 --max-agents(v2 语义:含 root)。
      子 agent 的模型调用走同一个 provider/relay,出网钉死对它们同样生效。
+     ⚠️ POA 与 --ephemeral 不共存:spawn_agent 默认 full-history fork 要读 parent
+     线程落盘的 rollout,--ephemeral 不落盘 → 每次 spawn 必失败(collab spawn
+     failed: no thread with id)。所以本脚本不加 --ephemeral(见 build_codex_cmd
+     注释;早期带着它的 poa-* smoke,trace 里都只有 root 一个线程。brainary-*-probe
+     那两轮 4 线程不是反证:探针提示词显式传了 fork_turns:"none",绕开了读盘路径)。
   4. 默认模型配置指向公司 relay:gpt-5.6-sol @ https://relay.lzbrainary.com/v1,
      reasoning effort high,wire_api=responses。web_search 照旧关死(服务端执行,
      搜得到上游真实 fix,机理见 run_codex_pro.build_codex_cmd 的注释)。
@@ -37,6 +42,10 @@
      思考/消息。make_report.py 优先读 trace 渲染执行过程(LLM输出/工具/子工具/思考/信息
      五类标签),没有 trace 的旧日志退回 --json 流。默认裁掉 inference request payload
      (逐 turn 全量 prompt,O(turns²) 大小,报告用不上);--trace full 保留。
+     token 消耗同理以 trace 为准(parse_trace_usage):stdout 的 turn.completed 只有
+     root session 自己的账,子 agent 的消耗不在里面,而且 root turn 收尾失败(如 429)
+     时整轮为 0;trace 聚合全部线程的 inference_completed,_meta 里 usage_source 自述
+     用的哪套账,agent_threads 记录线程数(含 root)。
 
 产物形状与 run_codex_pro.py 完全一致(.pred / logs/ / preds.json / run_meta.json),
 评测(eval_pro.py)和报告(pro_eval_report.py + make_report.py)两段原样共用。
@@ -111,7 +120,18 @@ def build_codex_cmd(args) -> str:
     parts = [
         "brainary-codex", "exec",
         "--json",
-        "--skip-git-repo-check", "--ephemeral",
+        # ⚠️ 与 run_codex_pro 版差一个 --ephemeral,是特意去掉的,别「对齐」回来:
+        # v2 的 collaboration__spawn_agent 默认 fork_turns="all"(full-history fork),
+        # spawn 时要从 thread store 读 parent 线程落盘的历史(fork 源码:
+        # agent/control/spawn.rs 的 spawn_forked_thread → read_stored_thread);
+        # --ephemeral 不落盘 → ThreadNotFound → 每次 spawn 都报
+        # "collab spawn failed: no thread with id: <root 自己的 id>",POA 只剩
+        # 显式 fork_turns:"none" 一条活路(早期 brainary-*-probe 的 4 线程就是
+        # 这么侥幸通过的),模型自然编排走默认值必败(A/B 实测:带 --ephemeral
+        # 1 个 thread_started,去掉后 root+子 agent,子 agent 结果能被 wait 到)。
+        # ephemeral 本来防的是往 ~/.codex/sessions 落盘,这里 CODEX_HOME=
+        # /opt/codexhome 在容器里,docker run --rm 退出即销毁,去掉没有代价。
+        "--skip-git-repo-check",
         "-s", "danger-full-access",
         "-C", base.REPO_DIR,
         "-c", f"model_provider={shlex.quote(p)}",
@@ -176,6 +196,75 @@ def prune_trace_requests(trace_dir: Path) -> None:
             # payload 路径是 bundle 相对路径("payloads/N.json"),不出 bundle 目录
             if rel.startswith("payloads/") and ".." not in rel:
                 (bundle / rel).unlink(missing_ok=True)
+
+
+def parse_trace_usage(trace_dir: Path) -> dict | None:
+    """从 trace bundle 聚合**全部线程**的 token 消耗,替代 stdout 口径。
+
+    stdout 的 turn.completed.usage 只有 root session 自己的账:TokenCount 事件
+    读的是本 session 的状态,子 agent 线程各记各的,从不聚合(Verified 侧实测
+    对账:root stdout 报的数与 trace 里 root 线程逐次推理之和分毫不差,子 agent
+    的完全不在里面)。POA 一开子 agent,parse_usage 就必然漏记;root turn 收尾
+    撞上 429(turn.failed)时更是整轮记 0——两个坑都在这里补上。
+
+    账本来源:inference_completed → response payload 里每次推理都带 token_usage
+    (字段与 USAGE_FIELDS 同名),覆盖所有线程。inference_failed 没有 usage
+    (流断在计费信息之前),不计。--trace on 只裁 request payload,response
+    原样保留,不影响这里;--trace off 没有 bundle → 返回 None,调用方退回
+    stdout 口径(_meta 里 usage_source 字段自述用的哪套账)。
+
+    turns 口径:root 线程 distinct codex_turn_id(做过推理的轮)——正常收尾时
+    与「turn.completed 条数」一致,收尾失败时比它诚实(干了活就算)。
+    另附 agent_threads:bundle 里的线程总数(含 root),POA 是否真的编排过
+    子 agent,一眼可查。
+    """
+    usage = {k: 0 for k in base.USAGE_FIELDS}
+    root_turns: set[str] = set()
+    threads: set[str] = set()
+    n_calls = 0
+    for bundle in trace_dir.glob("trace-*"):
+        tj = bundle / "trace.jsonl"
+        if not tj.is_file():
+            continue
+        root_tid = None
+        inferences = []
+        for line in tj.read_text(errors="replace").splitlines():
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            p = e.get("payload") or {}
+            if p.get("type") == "thread_started":
+                threads.add(p.get("thread_id") or "")
+                # v2 的 root 打 "/root";没有 multi-agent 时可能缺省
+                if root_tid is None and p.get("agent_path") in (None, "", "/root"):
+                    root_tid = p.get("thread_id")
+            elif p.get("type") == "inference_completed":
+                inferences.append(e)
+        for e in inferences:
+            rel = (e["payload"].get("response_payload") or {}).get("path", "")
+            # payload 路径是 bundle 相对路径,防目录穿越(prune 同款纪律)
+            if not rel.startswith("payloads/") or ".." in rel:
+                continue
+            f = bundle / rel
+            if not f.is_file():
+                continue
+            try:
+                tu = json.loads(f.read_text(errors="replace")).get("token_usage") or {}
+            except json.JSONDecodeError:
+                continue
+            n_calls += 1
+            for k in base.USAGE_FIELDS:
+                if isinstance(tu.get(k), int):
+                    usage[k] += tu[k]
+            if e.get("thread_id") == root_tid and e.get("codex_turn_id"):
+                root_turns.add(e["codex_turn_id"])
+    if n_calls == 0:
+        return None
+    usage["turns"] = len(root_turns)
+    usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
+    usage["agent_threads"] = len(threads)
+    return usage
 
 
 def dir_bytes(d: Path) -> int:
@@ -283,10 +372,12 @@ echo "===DIFF_END==="
               flush=True)
 
     trace_bytes = None
+    trace_usage = None
     if trace_dir is not None:
         if args.trace == "on":
             prune_trace_requests(trace_dir)
         trace_bytes = dir_bytes(trace_dir)
+        trace_usage = parse_trace_usage(trace_dir)
 
     agent_s = base.parse_agent_seconds(out)
     rec = {
@@ -304,7 +395,10 @@ echo "===DIFF_END==="
             "egress_ok": egr_ok,
             "egress_why": egr_why,
             "trace_bytes": trace_bytes,
-            **base.parse_usage(out),
+            # usage 优先用 trace 的全量账(含子 agent、含收尾失败的 turn),
+            # 退回 stdout 口径只发生在 --trace off 或 bundle 读不出来时。
+            "usage_source": "trace" if trace_usage is not None else "stdout",
+            **(trace_usage if trace_usage is not None else base.parse_usage(out)),
         },
     }
     (inst_dir / f"{iid}.pred").write_text(json.dumps(rec, indent=2))
