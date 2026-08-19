@@ -11,6 +11,8 @@ agent 也可以直接跑在宿主机上（见[宿主机模式](#宿主机模式a
 │  egress.py ──→ 建 --internal 网 + 起钉死目的地的 relay，先在真实
 │                镜像里过一遍探针，不通过就拒绝开跑
 │  run_codex_pro.py    ──→ <run>/<iid>/<iid>.pred + logs/ + preds.json + run_meta.json
+│                     换 agent：run_brainary_codex.py（brainary-codex fork 二进制，
+│                     exec() 写 POA + bash 等基础工具并存）
 │                     换位置：run_codex_pro_host.py（Codex 跑在宿主机，产物同形状，
 │                     ⚠️ 出网收敛在那边失效，只用来验链路，分数别拿去比）
 └──────────────────────────────────────────────────────────┘
@@ -37,6 +39,7 @@ agent 在推理容器里干了什么都不会污染评测。
 | `setup.sh` | 一键装环境：虚拟环境 + 依赖 + 官方仓库 + Codex Linux 二进制 + 数据集 + Docker 自检 |
 | `fetch_dataset.py` | 从 HuggingFace 把 731 条拉成 `swebench_pro.jsonl` |
 | `run_codex_pro.py` | 阶段 A：起容器把 Codex 挂进去改代码，收尾 `git diff` 出 patch |
+| `run_brainary_codex.py` | 换 agent：阶段 A 改用 brainary-codex fork 自建二进制（`brainary-codex-bin/`）。工具面靠 `model_catalog_json` 覆盖 `tool_mode`：`--code-mode on`（默认）＝ exec() 写 POA 编排子 agent + bash/apply_patch 等基础工具并存；`only`＝只有 exec()/wait；`off`＝纯基础工具对照组。`web_search` 照旧关死 |
 | `run_codex_pro_host.py` | 换位置：阶段 A 的 Codex 跑在宿主机，靠 `sbx` 桥进容器跑测试，不需要 Linux 二进制。**⚠️ 出网收敛在这里失效，别拿它的分数比** |
 | `egress.py` | 阶段 A 的出网收敛：建 `--internal` 网 + 起钉死目的地的 relay，并在真实镜像里跑探针自检（不通过就拒绝开跑）。见[数据污染](#数据污染镜像里带着答案) |
 | `sni_relay.py` | `egress.py` 起的 relay 本体，按 SNI 放行。**与 SWE-bench Verified 仓库里那份逐字节相同**（内容一致两边就复用同一个 relay 容器，改动请两边同步） |
