@@ -100,7 +100,11 @@ step "拉数据集（HuggingFace ScaleAI/SWE-bench_Pro，731 条）"
 if [ "$SKIP_DATASET" = 1 ]; then
   warn "跳过（--skip-dataset）"
 elif [ -s "$DATASET" ]; then
-  ok "已存在，跳过：$DATASET（$(wc -l < "$DATASET" | tr -d ' ') 条）"
+  # ${} 的花括号不能省：紧跟其后的全角「（」首字节是 0xef，macOS 自带的
+  # bash 3.2 在 UTF-8 locale 下会把它当成变量名的一部分，于是 set -u 判定
+  # $DATASET… 未定义直接退出。只有「数据集已存在」这条分支会走到，所以首次
+  # 安装看不出来，重跑 setup.sh 时才炸。
+  ok "已存在，跳过：${DATASET}（$(wc -l < "$DATASET" | tr -d ' ') 条）"
 else
   python fetch_dataset.py --output "$DATASET" || die "拉数据集失败（网络？）"
 fi
@@ -108,9 +112,9 @@ fi
 # ── 6. Docker 自检 ─────────────────────────────────────────
 step "检查 Docker 与 x86_64 模拟"
 if ! command -v docker >/dev/null 2>&1; then
-  warn "没装 Docker Desktop —— 推理和评测都跑不了，装完再跑一次本脚本"
+  warn "没装容器运行环境（OrbStack 或 Docker Desktop）—— 推理和评测都跑不了，装完再跑一次本脚本"
 elif ! docker info >/dev/null 2>&1; then
-  warn "Docker 没启动：open -a Docker，等 docker info 不报错后重跑本脚本"
+  warn "容器环境没启动：open -a OrbStack（或 open -a Docker），等 docker info 不报错后重跑本脚本"
 else
   ok "Docker $(docker info --format '{{.ServerVersion}}')"
   arch=$(docker run --rm --platform linux/amd64 alpine uname -m 2>/dev/null || echo FAIL)
@@ -124,9 +128,10 @@ else
     fi
   else
     warn "amd64 容器起不来（得到：${arch}）"
-    warn "Docker Desktop → Settings → General 勾上"
+    warn "用 Docker Desktop 的话：Settings → General 勾上"
     warn "  ☑ Use Rosetta for x86_64/amd64 emulation on Apple Silicon"
     warn "不开 Rosetta 会退化成 QEMU 软件模拟，慢到不可用。"
+    warn "用 OrbStack 的话 Rosetta 默认就开着，先确认它真的启动了。"
   fi
 fi
 
