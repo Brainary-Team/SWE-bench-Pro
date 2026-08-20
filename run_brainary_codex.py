@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """用 Brainary Codex(brainary-codex fork 自建二进制)作为 agent 跑 SWE-bench Pro。
 
-与 run_codex_pro.py 的区别只有「挂什么、开什么」,其余机器全部复用它的
+与 run_codex_pro.py 的区别只有「挂什么、开什么、说什么」,其余机器全部复用它的
 (剥历史 / 出网收敛 / 容器命名与超时清理 / 墓碑与原子聚合,一行不重写):
 
   1. 挂两个 musl 静态二进制(brainary-codex-bin/):
@@ -46,6 +46,10 @@
      root session 自己的账,子 agent 的消耗不在里面,而且 root turn 收尾失败(如 429)
      时整轮为 0;trace 聚合全部线程的 inference_completed,_meta 里 usage_source 自述
      用的哪套账,agent_threads 记录线程数(含 root)。
+  6. prompt:本文件持一份**独立副本**(见下面的 PROMPT / build_prompt),拆出来时与
+     run_codex_pro.PROMPT 逐字一致,之后可以只给 brainary-codex 调措辞,不惊动容器版
+     与宿主版。题面拼装(剥壳 + 官方 helper)照旧复用 base,分叉的只有模板本身。
+     是否已分叉写在 run_meta.json 的 prompt 字段里,开跑时也会打一行警告。
 
 产物形状与 run_codex_pro.py 完全一致(.pred / logs/ / preds.json / run_meta.json),
 评测(eval_pro.py)和报告(pro_eval_report.py + make_report.py)两段原样共用。
@@ -72,6 +76,49 @@ from pathlib import Path
 
 import egress
 import run_codex_pro as base
+
+# ─────────────────────────────── 任务描述 ───────────────────────────────
+# ⚠️ 这是 run_codex_pro.PROMPT 的**独立副本**,不是引用 —— 故意的:brainary-codex
+# 的工具面(code mode / POA)与容器版、宿主版都不同,要能单独调措辞,不该被
+# 「几家逐字一致」的纪律绑住。拆出来的那一刻两份逐字相同,这是对比基线。
+#
+# 改这里的代价:与 run_codex_pro / run_codex_pro_host 的差异不再是纯 scaffold 差异,
+# prompt 也变了 —— 分数不能再跟历史轮次并排比。所以 write_aggregates 把 prompt 的
+# sha 与 same_as_codex 记进 run_meta.json,开跑时也会打一行警告,事后一眼可查。
+#
+# ⚠️ {problem} 与 {repo_dir} 都是 str.format 的占位符:新增正文里的字面花括号
+# 必须写成 {{ }},否则 build_prompt 里的 .format() 直接抛 KeyError。
+PROMPT = """<pr_description>
+{problem}
+</pr_description>
+
+You are a software engineer working in the repository at {repo_dir}.
+Implement the change described above.
+
+## Boundaries
+- MODIFY: regular source files under {repo_dir}
+- DO NOT MODIFY: any test file, or CI/config files
+
+## Workflow
+1. Locate and read the relevant source files.
+2. Implement the change so it satisfies the requirements and the described interfaces.
+3. Keep the fix general and consistent with the surrounding code style.
+4. Consider edge cases.
+
+Leave your changes uncommitted in the working tree. Do not run `git commit`.
+"""
+
+
+def build_prompt(inst: dict) -> str:
+    """题面拼法与容器版完全一致,分叉的只有模板 —— 与 run_codex_pro_host 同款写法。
+
+    剥壳规则(_unwrap)与官方 helper 都只从 base 取,这里绝不另抄:731 条里有 328 条
+    的文本字段是双层 JSON 编码的,剥壳规则一旦分叉,题面会**悄悄变形**而不报错。
+    """
+    row = {**inst, **{k: base._unwrap(inst.get(k, "") or "")
+                      for k in ("problem_statement", "requirements", "interface")}}
+    return PROMPT.format(problem=base.create_problem_statement(row), repo_dir=base.REPO_DIR)
+
 
 # 容器里两个二进制的落点。入口挂成 brainary-codex 以便与官方 codex 区分,
 # host 的名字是查找协议的一部分,固定死。
@@ -280,7 +327,7 @@ def run_one(inst: dict, args, codex_bin: Path, outdir: Path, egr: dict | None = 
     """
     iid = inst["instance_id"]
     img = base.get_dockerhub_image_uri(iid, args.dockerhub_username, inst.get("repo", ""))
-    prompt = base.build_prompt(inst)
+    prompt = build_prompt(inst)          # 本文件自己的模板(见文件头第 6 点),不是 base 那份
 
     logs_dir = outdir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -411,6 +458,12 @@ echo "===DIFF_END==="
     return rec
 
 
+def text_sha(text: str, n: int = 12) -> str:
+    """prompt 的指纹。run_meta 只记 sha 不记正文:正文进 meta 会把 run_meta.json
+    撑大且难 diff,指纹足够回答「这轮跑的是哪版 prompt」。"""
+    return hashlib.sha256(text.encode()).hexdigest()[:n]
+
+
 def sha256_prefix(path: Path, n: int = 12) -> str:
     """记进 run_meta,让每轮跑分都能对上「是哪次构建的二进制」。"""
     h = hashlib.sha256()
@@ -437,6 +490,11 @@ def write_aggregates(outdir: Path, args, egr: dict | None = None) -> dict:
         # v2 语义:含 root。off 模式不下发(collaboration 保持官方默认面)
         "max_agents": args.max_agents if args.code_mode != "off" else None,
         "models_json": args.binaries_sha.get("models.json"),
+    }
+    meta["prompt"] = {                            # 任务描述自述:这轮到底喂的是哪版 prompt
+        "sha256": text_sha(PROMPT),
+        # false = 已与 run_codex_pro.PROMPT 分叉,与容器版/宿主版的分数不再纯 scaffold 可比
+        "same_as_codex": PROMPT == base.PROMPT,
     }
     meta["binaries"] = args.binaries_sha
     meta["trace"] = args.trace                    # 执行过程留痕:on(裁request)/full/off
@@ -579,6 +637,10 @@ def main() -> int:
           f"poa={'on,max_agents=%d' % args.max_agents if args.code_mode != 'off' else 'off'} "
           f"trace={args.trace}, model={args.model}, workers={args.workers}", flush=True)
     print(f"[run] 二进制: {args.binaries_sha}", flush=True)
+    if PROMPT != base.PROMPT:
+        # 不拦,只吼:分叉是允许的操作,但别让它在事后对比时才被发现。
+        print(f"[run] ⚠️ prompt 已与 run_codex_pro.PROMPT 分叉(sha {text_sha(PROMPT)}):"
+              f"这轮与容器版/宿主版的差异不只是 scaffold,慎与历史轮次并排比", flush=True)
 
     lock = threading.Lock()
     if rows:
